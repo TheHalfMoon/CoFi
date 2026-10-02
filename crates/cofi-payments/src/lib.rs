@@ -1,6 +1,9 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+mod payout;
+pub use payout::*;
+
 use cofi_billing::{BillingError, BillingInvoiceId, journal_entry_id_for_invoice};
 use cofi_ledger::{
     AccountId, AccountKind, CommitOutcome, Currency, EntryMetadata, JournalEntry, JournalEntryId,
