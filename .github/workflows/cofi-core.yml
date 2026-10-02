@@ -20,17 +20,23 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: cofi-core-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust:
-    name: Rust core qualification
+    name: Rust stable qualification
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Format
@@ -41,3 +47,19 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-targets --all-features
+
+  msrv:
+    name: Rust 1.85 MSRV
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: 1.85.0
+
+      - name: Check MSRV
+        run: cargo check --workspace --all-targets --all-features
