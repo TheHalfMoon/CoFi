@@ -289,13 +289,21 @@ impl Display for LedgerError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidCurrency(code) => {
-                write!(f, "currency must be exactly three uppercase ASCII letters: {code}")
+                write!(
+                    f,
+                    "currency must be exactly three uppercase ASCII letters: {code}"
+                )
             }
             Self::InvalidPostingAmount(amount) => {
-                write!(f, "posting amount must be a positive integer in minor units: {amount}")
+                write!(
+                    f,
+                    "posting amount must be a positive integer in minor units: {amount}"
+                )
             }
             Self::EmptyIdentifier(name) => write!(f, "{name} must not be empty"),
-            Self::InsufficientPostings => f.write_str("journal entry requires at least two postings"),
+            Self::InsufficientPostings => {
+                f.write_str("journal entry requires at least two postings")
+            }
             Self::InsufficientAccounts => {
                 f.write_str("journal entry requires at least two distinct accounts")
             }
@@ -317,6 +325,7 @@ impl Display for LedgerError {
 impl Error for LedgerError {}
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -342,11 +351,7 @@ mod tests {
             postings,
             1_700_000_000_000,
             1_700_000_000_100,
-            EntryMetadata::new(
-                Some("corr-1".to_owned()),
-                Some("idem-1".to_owned()),
-            )
-            .unwrap(),
+            EntryMetadata::new(Some("corr-1".to_owned()), Some("idem-1".to_owned())).unwrap(),
         )
     }
 
