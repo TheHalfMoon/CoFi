@@ -184,7 +184,9 @@ impl Ledger {
 
         let mut next_balances = Vec::with_capacity(deltas.len());
         for (account_id, delta) in deltas {
-            let current = self.balances.get(&account_id).copied().unwrap_or_default();
+            let current = self.balances.get(&account_id).copied().ok_or(
+                LedgerStateError::InternalInvariant("registered account is missing its balance"),
+            )?;
             let debits = current
                 .debits
                 .checked_add(delta.debits)
@@ -450,6 +452,24 @@ mod tests {
             Err(LedgerStateError::MissingIdempotencyKey)
         );
         assert_eq!(ledger.entry_count(), 0);
+    }
+
+    #[test]
+    fn missing_registered_account_balance_fails_closed() {
+        let mut ledger = funded_ledger();
+        ledger.balances.remove(&id("cash"));
+        let candidate = entry("entry-1", Some("idem-1"), "cash", "revenue", usd(), 100);
+        assert_eq!(
+            ledger.commit(candidate),
+            Err(LedgerStateError::InternalInvariant(
+                "registered account is missing its balance"
+            ))
+        );
+        assert_eq!(ledger.entry_count(), 0);
+        assert_eq!(
+            ledger.balance(&id("revenue")),
+            Some(AccountBalance::default())
+        );
     }
 
     #[test]
