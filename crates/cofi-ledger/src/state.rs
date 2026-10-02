@@ -96,6 +96,7 @@ pub struct Ledger {
     accounts: BTreeMap<AccountId, Account>,
     entries: BTreeMap<JournalEntryId, JournalEntry>,
     idempotency: BTreeMap<String, JournalEntryId>,
+    business_keys: BTreeMap<String, JournalEntryId>,
     balances: BTreeMap<AccountId, AccountBalance>,
 }
 
@@ -156,6 +157,13 @@ impl Ledger {
                     idempotency_key.to_owned(),
                 ))
             };
+        }
+
+        let business_key = entry.metadata().business_key().map(str::to_owned);
+        if let Some(key) = business_key.as_deref() {
+            if self.business_keys.contains_key(key) {
+                return Err(LedgerStateError::BusinessKeyConflict(key.to_owned()));
+            }
         }
 
         if self.entries.contains_key(entry.id()) {
@@ -233,6 +241,9 @@ impl Ledger {
         let entry_id = entry.id().clone();
         self.idempotency
             .insert(idempotency_key.to_owned(), entry_id.clone());
+        if let Some(key) = business_key {
+            self.business_keys.insert(key, entry_id.clone());
+        }
         self.entries.insert(entry_id, entry);
         Ok(CommitOutcome::Committed)
     }
@@ -243,6 +254,7 @@ pub enum LedgerStateError {
     DuplicateAccount(AccountId),
     MissingIdempotencyKey,
     IdempotencyConflict(String),
+    BusinessKeyConflict(String),
     DuplicateEntryId(JournalEntryId),
     UnknownAccount(AccountId),
     AccountCurrencyMismatch {
@@ -267,6 +279,12 @@ impl Display for LedgerStateError {
                 write!(
                     f,
                     "idempotency key was reused with different content: {key}"
+                )
+            }
+            Self::BusinessKeyConflict(key) => {
+                write!(
+                    f,
+                    "business key already has committed financial history: {key}"
                 )
             }
             Self::DuplicateEntryId(id) => {
@@ -347,6 +365,32 @@ mod tests {
                 idempotency_key.map(str::to_owned),
             )
             .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn entry_with_business_key(
+        entry_id: &str,
+        idempotency_key: &str,
+        business_key: &str,
+        amount: i128,
+    ) -> JournalEntry {
+        let metadata = EntryMetadata::new(
+            Some(format!("corr-{entry_id}")),
+            Some(idempotency_key.to_owned()),
+        )
+        .unwrap()
+        .with_business_key(Some(business_key.to_owned()))
+        .unwrap();
+        JournalEntry::new(
+            JournalEntryId::new(entry_id).unwrap(),
+            vec![
+                Posting::new(id("cash"), usd(), Side::Debit, amount).unwrap(),
+                Posting::new(id("revenue"), usd(), Side::Credit, amount).unwrap(),
+            ],
+            1_700_000_000_000,
+            1_700_000_000_100,
+            metadata,
         )
         .unwrap()
     }
@@ -468,6 +512,38 @@ mod tests {
             ledger.commit(second),
             Err(LedgerStateError::IdempotencyConflict("idem-1".to_owned()))
         );
+        assert_eq!(ledger.entry_count(), 1);
+        assert_eq!(ledger.balance(&id("cash")).unwrap().debits(), 100);
+    }
+
+    #[test]
+    fn business_key_cannot_create_second_financial_history() {
+        let mut ledger = funded_ledger();
+        let first = entry_with_business_key("entry-1", "idem-1", "invoice-1", 100);
+        let second = entry_with_business_key("entry-2", "idem-2", "invoice-1", 100);
+        assert_eq!(ledger.commit(first), Ok(CommitOutcome::Committed));
+        let before_cash = ledger.balance(&id("cash"));
+        let before_revenue = ledger.balance(&id("revenue"));
+        assert_eq!(
+            ledger.commit(second),
+            Err(LedgerStateError::BusinessKeyConflict(
+                "invoice-1".to_owned()
+            ))
+        );
+        assert_eq!(ledger.entry_count(), 1);
+        assert_eq!(ledger.balance(&id("cash")), before_cash);
+        assert_eq!(ledger.balance(&id("revenue")), before_revenue);
+    }
+
+    #[test]
+    fn exact_replay_with_business_key_remains_idempotent() {
+        let mut ledger = funded_ledger();
+        let candidate = entry_with_business_key("entry-1", "idem-1", "invoice-1", 100);
+        assert_eq!(
+            ledger.commit(candidate.clone()),
+            Ok(CommitOutcome::Committed)
+        );
+        assert_eq!(ledger.commit(candidate), Ok(CommitOutcome::Replayed));
         assert_eq!(ledger.entry_count(), 1);
         assert_eq!(ledger.balance(&id("cash")).unwrap().debits(), 100);
     }
