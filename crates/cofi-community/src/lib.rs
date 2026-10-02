@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use cofi_ledger::{AccountId, Currency, Ledger, LedgerScopeId};
+use cofi_ledger::{AccountId, AccountKind, Currency, Ledger, LedgerScopeId};
+
+mod allocation;
+pub use allocation::*;
 
 macro_rules! domain_id {
     ($name:ident, $label:literal) => {
@@ -325,6 +328,12 @@ impl CommunityRegistry {
         let account = ledger.account(fund.ledger_account_id()).ok_or_else(|| {
             CommunityError::UnknownLedgerAccount(fund.ledger_account_id().clone())
         })?;
+        if account.kind() != AccountKind::Asset {
+            return Err(CommunityError::FundLedgerAccountKindMismatch {
+                fund_id: fund.id().clone(),
+                actual: account.kind(),
+            });
+        }
         if account.scope_id().as_str() != community.organization_id().as_str() {
             return Err(CommunityError::FundLedgerScopeMismatch {
                 organization_id: community.organization_id().clone(),
@@ -411,6 +420,10 @@ pub enum CommunityError {
     UnknownParty(PartyId),
     UnknownCommunity(CommunityId),
     UnknownLedgerAccount(AccountId),
+    FundLedgerAccountKindMismatch {
+        fund_id: FundId,
+        actual: AccountKind,
+    },
     CrossOrganizationMembership {
         party_organization_id: OrganizationId,
         community_organization_id: OrganizationId,
@@ -462,6 +475,11 @@ impl Display for CommunityError {
             Self::UnknownLedgerAccount(id) => {
                 write!(f, "unknown ledger account: {}", id.as_str())
             }
+            Self::FundLedgerAccountKindMismatch { fund_id, actual } => write!(
+                f,
+                "fund {} requires an Asset ledger account; got {actual:?}",
+                fund_id.as_str()
+            ),
             Self::CrossOrganizationMembership {
                 party_organization_id,
                 community_organization_id,
