@@ -1,0 +1,43 @@
+name: CoFi Core CI
+
+on:
+  push:
+    branches:
+      - main
+      - p01/cofi-ledger-foundation
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/**
+      - .github/workflows/cofi-core.yml
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/**
+      - .github/workflows/cofi-core.yml
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust core qualification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-targets --all-features
