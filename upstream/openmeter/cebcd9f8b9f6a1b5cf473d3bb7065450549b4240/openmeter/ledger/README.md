@@ -1,0 +1,205 @@
+# Ledger
+
+The ledger is OpenMeter's immutable accounting journal for customer credit,
+receivables, accrued usage, recognized earnings, payments, currency conversion,
+and breakage.
+
+## Domain model
+
+Accounts express ownership and accounting purpose. Subaccounts are the actual
+posting addresses; a subaccount's normalized route is part of its identity.
+
+Customer accounts are provisioned per customer. Business accounts are shared
+within a namespace.
+
+| account | meaning |
+| --- | --- |
+| `customer_fbo` | customer credit or stored value; not a literal regulated FBO bank account |
+| `customer_receivable` | value owed by the customer, including open and payment-authorized stages |
+| `customer_accrued` | acknowledged usage or spend not yet recognized as earnings |
+| `wash` | the external payment or cash boundary |
+| `earnings` | recognized business revenue |
+| `brokerage` | business-side counterparty for currency conversion |
+| `breakage` | expired or otherwise forfeited customer credit |
+
+The historical ledger stores immutable transaction groups, transactions, and
+entries. Balances are projections over those entries; they are not mutable
+facts stored independently from the journal.
+
+## Ownership and boundaries
+
+- The ledger owns balanced posting, route identity, permitted accounting flows,
+  collection from concrete balances, corrections, and accounting provenance.
+- Transaction templates encode posting mechanics. They do not decide charge
+  lifecycle, payment lifecycle, settlement mode, or invoice orchestration.
+- `chargeadapter` translates charge lifecycle events into ledger templates.
+  Charges decide when an effect is due; the ledger decides how that effect is
+  represented and validated. See the [charges domain](../billing/charges/README.md).
+- The collector owns source selection and correction unwind order. Callers
+  provide the target amount and attribution; they must not recreate collection
+  policy.
+- `customerbalance` is a customer-facing projection over booked ledger state,
+  breakage, and not-yet-booked charge impacts. It does not own posting,
+  collection, or correction rules.
+- Account resolvers provision canonical customer and namespace business
+  accounts. Higher-level domains request account-specific route parameters
+  rather than assembling generic accounts or posting addresses.
+
+## Transaction invariants
+
+- Every transaction sums to zero. Each entry amount is valid at the posting
+  currency's precision.
+- `CommitGroup` validates the whole input, locks every affected parent account,
+  and books the group atomically in the caller's database transaction.
+- Default routing rules constrain allowed account-type combinations, flow
+  direction, authorization stages, route compatibility, and dimension scope.
+  A balanced transaction can still be invalid.
+- Reversal and correction logic follows the actual original entries. It
+  preserves charge provenance and route pairing, links replacement postings to
+  their source entries, and uses deterministic source order rather than
+  recreating the original postings from current charge metadata.
+- Collection provenance identifies independently correctable occurrences. Core
+  validators require entries to balance per origin and currency identity.
+- [Correction](collector/correction/README.md) selects remaining account amounts
+  in reverse original collection or backing order. Exact original-entry references bound
+  reversals. Provenance and legacy lineage use the same source-selection policy.
+- Credit-backed earnings recognition consumes only accrued buckets whose
+  source credit and spend charge are both present and distinct. Buckets without
+  that provenance - including invoice-backed accrued value and unbackfilled
+  advances - remain deferred. Unknown-cost promotional credits also remain
+  deferred. Recognition reads origin-tracked accrued buckets directly; legacy
+  recognition maps segments to their original allocation or backfill postings.
+  Both preserve source, spend, currency identity, and tax route. Only the legacy
+  path updates lineage, using the exact amounts selected for posting.
+
+The [advance service](advance/README.md) owns advance creation, backfill, and correction
+postings. Collector selects correction amounts and unwinds earnings; credit
+issuance coordinates backfill with settlement and breakage. Callers commit the
+plans and persist their bookkeeping in the enclosing database transaction.
+
+The historical ledger makes a group atomic, but it does not deduplicate a
+repeated `CommitGroup` call. The initiating domain must make retries safe and
+persist the returned group reference with its own lifecycle state. Ledger
+annotations and entry identity preserve accounting meaning and provenance; they
+are not operation idempotency keys.
+
+## Collection provenance
+
+Entry provenance carries three distinct identities:
+
+| Field | Meaning |
+| --- | --- |
+| `CollectionOriginID` | One original collection source slice, including the paired advance issue when applicable |
+| `SourceChargeID` | The charge supplying the value; absent for an uncovered advance |
+| `SpendChargeID` | The charge consuming the value |
+
+An origin is minted when credit is collected into accrued or used to cover
+receivable, or when an advance is issued and collected. Purchase issuance alone
+does not start a collection origin. Backfill, recognition, correction, and
+associated breakage releases/reopens preserve the origin. Collecting restored
+credit again starts another origin, even for the same source and spend charges.
+
+Origins group history; they do not replace source order or exact reversal links.
+`CollectionSource` preserves selection order and pairing, while `CorrectionSource`
+references the original entry being offset. Amounts come from ledger entries.
+
+Within each transaction, origin-bearing entries must have one non-empty spend
+charge per origin and currency identity. Transfers between account types must
+also preserve source attribution. Same-account receivable or accrued
+translations may attribute an unknown source to a purchase, or reverse that
+attribution; they cannot transfer attribution between two purchases.
+Service-level checks under posting locks bound corrections against remaining
+balances and original-entry reversal capacity.
+
+An absent origin does not by itself imply legacy lineage: purchase issuance,
+payment, and other unrelated entries also have no collection origin. Legacy
+collection lifecycle behavior remains in the
+[compatibility path](../billing/charges/legacylineage/README.md).
+See the [migration guide](../../docs/migration-guides/2026-09-17-ledger-collection-provenance.md)
+for deployment and rollback constraints.
+
+## Querying provenance
+
+`ProvenanceFilter` absence means any value; `Some(nil)` means entries without
+that ID; `Some(&id)` matches that ID. `Provenance.Filter()` pins all three fields,
+including nils. Balance queries must group by any provenance dimension that
+needs to remain separate; sharing a subaccount does not imply sharing an origin.
+`OldestMatchingEntryCreatedAt` is the earliest creation time among entries
+matching the bucket query, not an effective-time boundary.
+
+`ListTransactions.EntryFilter` selects transactions containing a matching entry.
+By default, each result contains all its entries, including other origins.
+`ReturnOnlyMatchingEntries` explicitly returns only the matching entries. Such a
+result is a transaction view, not necessarily a complete balanced transaction.
+
+## Route invariants
+
+`CreditFilters` holds credit restrictions and matches them against a concrete
+`Route`. Feature and plan dimensions combine with AND; entries within a dimension
+combine with OR. Empty dimensions impose no restriction. Restricted dimensions
+do not match routes without recorded attribution.
+
+Plans use a catalog key and an optional version comparison: exactly one of `eq`,
+`in`, `gte`, or `lte`. Omission matches all versions, including future versions.
+Spend routes use the immutable plan snapshot on [charges](../billing/charges/README.md)
+and carry an exact version. Credit-source routes carry the grant's restrictions.
+Collection, advance backfill, and live balance allocation share `Matches`;
+`Equal` compares complete normalized filter sets for bucket identity.
+
+JSON storage uses v1 for features and v2 for plans. Omitted in-memory versions
+are selected during validation, normalization, and encoding; explicit versions
+are preserved. Stored JSON requires a supported version and rejects unknown
+fields. Storage versions do not affect equality or exact route lookup.
+Legacy grant and route feature columns remain present but unused. Deprecated
+lineage retains its feature storage; plan-restricted grants cannot match its
+unattributed advances.
+
+Routes carry currency, credit filters (features and plans), cost basis, credit
+priority, receivable authorization status, tax code, and tax behavior. These
+are accounting identity, not optional metadata. Dropping a populated dimension
+during translation or filtering can merge economically distinct balances while
+leaving each transaction locally balanced.
+
+- Routes are normalized before key creation and querying. Feature order is not
+  semantic.
+- `Route.Filter()` pins present values, including explicit nil values.
+  `RouteFilter` absence means "do not filter"; it differs from filtering for a
+  nil route dimension.
+- Credit filter dimensions belong only on FBO and receivable routes. Tax dimensions
+  belong only on accrued and earnings routes; FBO sources acquire the charge's
+  tax attribution when value moves into accrued.
+- Currency and cost-basis attribution survive the relevant FBO, receivable,
+  accrued, earnings, wash, brokerage, and breakage legs.
+- Credit priority controls FBO collection order. Corrections unwind the
+  recorded collection order rather than applying today's priorities.
+- Receivable authorization is an accounting stage. Moving between open and
+  authorized routes is a ledger transaction, not an in-place flag update.
+
+Adding or changing a route dimension is a storage and compatibility change. It
+affects normalization, routing-key versions, schema persistence, filters,
+account-specific route parameters, transaction rules, corrections, and
+historical data—not only the `Route` struct.
+
+## Feature-restricted balances
+
+Public balance filtering and source allocability are related but distinct:
+
+- no feature filter means the whole credit portfolio
+- an unrestricted-only filter selects routes with no feature restriction
+- filtering for one feature includes unrestricted routes and routes containing
+  that feature
+- unrestricted credit can fund any charge; restricted credit can fund only a
+  matching feature
+
+Public filtering cannot be implemented as exact route equality, and a public
+balance result is not necessarily the set of sources allocable to every charge.
+
+## Time and balance boundaries
+
+- `BookedAt` is accounting effective time. `CreatedAt` and transaction ID make
+  ordering deterministic when booked times tie.
+- `AsOf` and cursor behavior apply before customer-facing projection; future
+  ledger or breakage facts cannot leak into historical views.
+- `historical.Ledger` enforces transaction invariance, not post-transaction
+  account-balance constraints. Product-specific bounds, including when a
+  balance may go negative, belong to higher-level flows and collectors.

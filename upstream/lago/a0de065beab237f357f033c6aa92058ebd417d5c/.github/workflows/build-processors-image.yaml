@@ -1,0 +1,23 @@
+name: "Build Events Processor Production Image"
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "events-processor/**"
+  workflow_dispatch:
+
+jobs:
+  build-processor-image:
+    name: Build Events Processor Image
+    uses: ./.github/workflows/docker-build-multi-arch.yaml
+    with:
+      image-name: 201661579678.dkr.ecr.us-east-1.amazonaws.com/lago-events-processor
+      registry: ecr
+      aws-region: us-east-1
+      platforms: amd64,arm64
+      context: events-processor
+      dockerfile: events-processor/Dockerfile
+    secrets:
+      registry-user: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      registry-token: ${{ secrets.AWS_SECRET_ACCESS_KEY }}

@@ -1,0 +1,344 @@
+package entutils
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"strconv"
+	"sync"
+
+	"entgo.io/ent/dialect"
+	"github.com/oklog/ulid/v2"
+
+	"github.com/openmeterio/openmeter/pkg/framework/transaction"
+)
+
+type RawEntConfig struct {
+	// driver used for executing database requests.
+	Driver dialect.Driver
+	// debug enable a debug logging.
+	Debug bool
+	// log used for logging on debug mode.
+	Log func(...any)
+
+	// Hooks and interceptors are excluded in transaction handling
+	// due to differing types.
+	//
+	// TODO: implement them in the templating when creating the new transactional client
+	// from this RawEntConfig.
+
+	// // hooks to execute on mutations.
+	// hooks *hooks
+	// // interceptors to execute on queries.
+	// inters *inters
+}
+
+type Transactable interface {
+	Commit() error
+	Rollback() error
+	SavePoint(name string) error
+	RollbackTo(name string) error
+	Release(name string) error
+}
+
+type TxHijacker interface {
+	HijackTx(ctx context.Context, opts *sql.TxOptions) (context.Context, *RawEntConfig, Transactable, error)
+}
+
+func NewTxDriver(driver Transactable, cfg *RawEntConfig) *TxDriver {
+	return &TxDriver{
+		id:     ulid.Make().String(),
+		driver: driver,
+		cfg:    cfg,
+	}
+}
+
+type txSavepoint int
+
+const (
+	txSavepointNone txSavepoint = 0
+)
+
+func (sp txSavepoint) Next() txSavepoint {
+	return sp + 1
+}
+
+func (sp txSavepoint) Prev() txSavepoint {
+	if sp == txSavepointNone {
+		return txSavepointNone
+	}
+
+	return sp - 1
+}
+
+func (sp txSavepoint) String() string {
+	return "s" + strconv.Itoa(int(sp))
+}
+
+// txCallbacks tracks notifications by savepoint scope. Releasing a savepoint
+// retains its callbacks; rolling it back discards callbacks registered within it.
+type txCallbacks struct {
+	callbacks []func()
+	marks     map[txSavepoint]int
+}
+
+func (c *txCallbacks) SavePoint(stage txSavepoint) {
+	if c.marks == nil {
+		c.marks = make(map[txSavepoint]int)
+	}
+	c.marks[stage] = len(c.callbacks)
+}
+
+func (c *txCallbacks) Release(stage txSavepoint) {
+	for checkpoint := range c.marks {
+		if checkpoint >= stage {
+			delete(c.marks, checkpoint)
+		}
+	}
+}
+
+// RollbackTo retains the target checkpoint, like PostgreSQL, so it can be reused.
+func (c *txCallbacks) RollbackTo(stage txSavepoint) {
+	c.callbacks = c.callbacks[:c.marks[stage]]
+	for checkpoint := range c.marks {
+		if checkpoint > stage {
+			delete(c.marks, checkpoint)
+		}
+	}
+}
+
+type TxDriver struct {
+	id     string
+	driver Transactable
+	// db.config is nominally different but structurally identical for all generations of entgo,
+	// so we represent it as an interface{} here
+	cfg *RawEntConfig
+
+	mu   sync.Mutex
+	once sync.Once
+
+	currentSavepoint txSavepoint
+	afterCommit      txCallbacks
+	finished         bool
+
+	err error
+}
+
+var _ transaction.Driver = &TxDriver{}
+
+// ID identifies the outer transaction. Nested savepoints share this identity.
+func (t *TxDriver) ID() string {
+	return t.id
+}
+
+func (t *TxDriver) GetConfig() *RawEntConfig {
+	return t.cfg
+}
+
+// Commit commits the (complete) transaction.
+func (t *TxDriver) Commit() error {
+	callbacks, err := t.commit()
+	if err != nil {
+		return err
+	}
+	for _, callback := range callbacks {
+		callback()
+	}
+	return nil
+}
+
+// commit protects transaction state and transfers ownership of the callback list
+// to Commit before unlocking. Notifications run outside the lock so a callback
+// can call a driver method without deadlocking.
+func (t *TxDriver) commit() ([]func(), error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.err != nil {
+		t.afterCommit = txCallbacks{}
+		return nil, t.err
+	}
+
+	if t.currentSavepoint != txSavepointNone {
+		if err := t.driver.Release(t.currentSavepoint.String()); err == nil {
+			t.afterCommit.Release(t.currentSavepoint)
+			t.currentSavepoint = t.currentSavepoint.Prev()
+		} else {
+			t.err = err
+			t.afterCommit = txCallbacks{}
+		}
+		return nil, t.err
+	}
+
+	t.err = t.driver.Commit()
+	callbacks := t.afterCommit.callbacks
+	t.afterCommit = txCallbacks{}
+	t.finished = true
+	return callbacks, t.err
+}
+
+// Rollback rolls back the (complete) transaction.
+func (t *TxDriver) Rollback() error {
+	// lock so we don't use the driver twice
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// If there was an error before, we don't do anything
+	if t.err != nil {
+		t.afterCommit = txCallbacks{}
+		return t.err
+	}
+
+	if t.currentSavepoint != txSavepointNone {
+		// If we're not at the top level, we rollback to the savepoint
+		if err := t.driver.RollbackTo(t.currentSavepoint.String()); err == nil {
+			t.afterCommit.RollbackTo(t.currentSavepoint)
+			t.currentSavepoint = t.currentSavepoint.Prev()
+		} else {
+			t.err = err
+			t.afterCommit = txCallbacks{}
+		}
+	} else {
+		// If we're at the top level, we rollback the transaction
+		t.err = t.driver.Rollback()
+		t.afterCommit = txCallbacks{}
+		t.finished = true
+	}
+
+	return t.err
+}
+
+func (t *TxDriver) SavePoint() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	skipSavePoint := false
+
+	t.once.Do(func() {
+		// As savePoint() is called each time we use the wrapper (including the first)
+		// we don't want to create a savepoint for the first call, otherwise the transaction itself
+		// would never be closed.
+		skipSavePoint = true
+	})
+
+	if !skipSavePoint {
+		next := t.currentSavepoint.Next()
+
+		err := t.driver.SavePoint(next.String())
+		if err != nil {
+			return err
+		}
+
+		t.currentSavepoint = next
+		t.afterCommit.SavePoint(next)
+	}
+
+	return nil
+}
+
+// AfterCommit registers a notification to run after the outer transaction commits.
+// Callbacks registered within a rolled-back savepoint are discarded. Callbacks
+// must not perform work whose success is required for the transaction.
+//
+// Callbacks run synchronously outside the driver mutex: invoking them under the
+// lock would deadlock a callback that calls a mutex-protected driver method.
+// The transaction is already finished, so callbacks cannot extend it or register
+// further after-commit notifications.
+func (t *TxDriver) AfterCommit(callback func()) error {
+	if callback == nil {
+		return fmt.Errorf("after-commit callback is nil")
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.err != nil {
+		return t.err
+	}
+	if t.finished {
+		return fmt.Errorf("transaction already finished")
+	}
+
+	t.afterCommit.callbacks = append(t.afterCommit.callbacks, callback)
+	return nil
+}
+
+// Able to start a new transaction
+type TxCreator = transaction.Creator
+
+// Able to use an existing transaction
+type TxUser[T any] interface {
+	// Creates a new instance of the adapter using the provided transaction.
+	// Example:
+	//
+	// type dbAdapter struct {
+	//     db *db.Client
+	// }
+	//
+	// func (d *dbAdapter) WithTx(ctx context.Context, tx *entutils.TxDriver) SomeDB[db1.Example1] {
+	//     // NewTxClientFromRawConfig gets generated when using expose.tpl
+	//     txClient := db.NewTxClientFromRawConfig(ctx, *tx.GetConfig())
+	//     res := &db1Adapter{db: txClient.Client()}
+	//     return res
+	// }
+	WithTx(ctx context.Context, tx *TxDriver) T
+	Self() T
+}
+
+// TransactingRepo is a helper that can be used inside repository methods.
+// It uses any preexisting transaction in the context if exists.
+func TransactingRepo[R, T any](
+	ctx context.Context,
+	repo interface {
+		TxUser[T]
+		TxCreator
+	},
+	cb func(ctx context.Context, rep T) (R, error),
+) (R, error) {
+	var def R
+	tx, err := GetDriverFromContext(ctx)
+	if err != nil {
+		// For all other errors, we return the error
+		if _, ok := err.(*transaction.DriverNotFoundError); !ok {
+			return def, err
+		}
+
+		// If we're not in a transaction, we just use the repo
+		return cb(ctx, repo.Self())
+	}
+
+	// If we're in a transaction, we use it
+	return cb(ctx, repo.WithTx(ctx, tx))
+}
+
+// TransactingRepoWithNoValue is a helper that can be used inside repository methods.
+func TransactingRepoWithNoValue[T any](
+	ctx context.Context,
+	repo interface {
+		TxUser[T]
+		TxCreator
+	},
+	cb func(ctx context.Context, rep T) error,
+) error {
+	_, err := TransactingRepo(ctx, repo, func(ctx context.Context, rep T) (interface{}, error) {
+		return nil, cb(ctx, rep)
+	})
+	return err
+}
+
+func asEntDriver(drv transaction.Driver) (*TxDriver, error) {
+	entTxDriver, ok := drv.(*TxDriver)
+	if !ok {
+		return nil, fmt.Errorf("tx driver is not ent tx driver")
+	}
+	return entTxDriver, nil
+}
+
+// Only use for direct interacton with the Ent driver implementation
+func GetDriverFromContext(ctx context.Context) (*TxDriver, error) {
+	driver, err := transaction.GetDriverFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return asEntDriver(driver)
+}

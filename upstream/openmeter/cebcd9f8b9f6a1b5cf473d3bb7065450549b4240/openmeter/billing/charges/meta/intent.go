@@ -1,0 +1,177 @@
+package meta
+
+import (
+	"errors"
+	"fmt"
+	"maps"
+	"slices"
+
+	"github.com/samber/lo"
+
+	"github.com/openmeterio/openmeter/openmeter/billing"
+	"github.com/openmeterio/openmeter/openmeter/currencies"
+	"github.com/openmeterio/openmeter/openmeter/ledger"
+	"github.com/openmeterio/openmeter/openmeter/productcatalog"
+	"github.com/openmeterio/openmeter/pkg/equal"
+	"github.com/openmeterio/openmeter/pkg/models"
+	"github.com/openmeterio/openmeter/pkg/timeutil"
+)
+
+type Intent struct {
+	SubscriptionPlan *SubscriptionPlan            `json:"subscriptionPlan,omitempty"`
+	ManagedBy        billing.InvoiceLineManagedBy `json:"managedBy"`
+	CustomerID       string                       `json:"customerID"`
+
+	Annotations models.Annotations `json:"annotations"`
+
+	Currency  currencies.Currency          `json:"currency"`
+	TaxConfig productcatalog.TaxCodeConfig `json:"taxConfig"`
+
+	UniqueReferenceID *string                `json:"childUniqueReferenceID"`
+	Subscription      *SubscriptionReference `json:"subscription"`
+}
+
+var _ models.Equaler[Intent] = Intent{}
+
+// Equal compares currency identity without treating expanded currency data as intent.
+func (i Intent) Equal(other Intent) bool {
+	// Note: we don't want to hack a partial Equal method for the currency, that's why we have a custom
+	// Equal method for the intent.
+	if (i.Currency.Currency == nil) != (other.Currency.Currency == nil) {
+		return false
+	}
+
+	if i.Currency.Currency != nil && !i.Currency.Reference().Equal(other.Currency.Reference()) {
+		return false
+	}
+
+	return i.ManagedBy == other.ManagedBy &&
+		i.CustomerID == other.CustomerID &&
+		i.Annotations.Equal(other.Annotations) &&
+		i.TaxConfig.TaxCodeID == other.TaxConfig.TaxCodeID &&
+		equal.ComparablePtrEqual(i.TaxConfig.Behavior, other.TaxConfig.Behavior) &&
+		equal.ComparablePtrEqual(i.UniqueReferenceID, other.UniqueReferenceID) &&
+		equal.PtrEqual(i.Subscription, other.Subscription)
+}
+
+func (i Intent) Clone() Intent {
+	out := i
+	if i.SubscriptionPlan != nil {
+		out.SubscriptionPlan = lo.ToPtr(*i.SubscriptionPlan)
+	}
+
+	// Keep intent cloning infallible for developer ergonomics; annotations are
+	// only shallow-cloned here so GetEffectiveIntent does not need an error return.
+	out.Annotations = maps.Clone(i.Annotations)
+	out.Currency = i.Currency.Clone()
+
+	if i.UniqueReferenceID != nil {
+		out.UniqueReferenceID = lo.ToPtr(*i.UniqueReferenceID)
+	}
+
+	if i.Subscription != nil {
+		out.Subscription = lo.ToPtr(*i.Subscription)
+	}
+
+	if i.TaxConfig.Behavior != nil {
+		out.TaxConfig.Behavior = lo.ToPtr(*i.TaxConfig.Behavior)
+	}
+
+	return out
+}
+
+func (i Intent) Validate() error {
+	var errs []error
+	if i.SubscriptionPlan != nil {
+		if err := i.SubscriptionPlan.Validate(); err != nil {
+			errs = append(errs, fmt.Errorf("subscription plan: %w", err))
+		}
+	}
+
+	if !slices.Contains(billing.InvoiceLineManagedBy("").Values(), string(i.ManagedBy)) {
+		errs = append(errs, fmt.Errorf("invalid managed by %s", i.ManagedBy))
+	}
+
+	if i.CustomerID == "" {
+		errs = append(errs, fmt.Errorf("customer ID is required"))
+	}
+
+	if err := i.Currency.Validate(); err != nil {
+		errs = append(errs, fmt.Errorf("currency: %w", err))
+	}
+
+	if err := i.TaxConfig.Validate(); err != nil {
+		errs = append(errs, fmt.Errorf("tax config: %w", err))
+	}
+
+	if i.Subscription != nil {
+		if err := i.Subscription.Validate(); err != nil {
+			errs = append(errs, fmt.Errorf("subscription: %w", err))
+		}
+	}
+
+	if i.UniqueReferenceID != nil && *i.UniqueReferenceID == "" {
+		errs = append(errs, fmt.Errorf("unique reference ID cannot be empty"))
+	}
+
+	return models.NewNillableGenericValidationError(errors.Join(errs...))
+}
+
+type IntentMutableFields struct {
+	Name        string          `json:"name"`
+	Description *string         `json:"description"`
+	Metadata    models.Metadata `json:"metadata"`
+
+	ServicePeriod     timeutil.ClosedPeriod `json:"servicePeriod"`
+	FullServicePeriod timeutil.ClosedPeriod `json:"fullServicePeriod"`
+	BillingPeriod     timeutil.ClosedPeriod `json:"billingPeriod"`
+}
+
+func (i IntentMutableFields) Clone() IntentMutableFields {
+	out := i
+
+	if i.Description != nil {
+		out.Description = lo.ToPtr(*i.Description)
+	}
+
+	out.Metadata = i.Metadata.Clone()
+
+	return out
+}
+
+func (i IntentMutableFields) Validate() error {
+	var errs []error
+
+	if i.Name == "" {
+		errs = append(errs, fmt.Errorf("name is required"))
+	}
+
+	if err := i.ServicePeriod.Validate(); err != nil {
+		errs = append(errs, fmt.Errorf("service period: %w", err))
+	}
+
+	if err := i.FullServicePeriod.Validate(); err != nil {
+		errs = append(errs, fmt.Errorf("full service period: %w", err))
+	}
+
+	if err := i.BillingPeriod.Validate(); err != nil {
+		errs = append(errs, fmt.Errorf("billing period: %w", err))
+	}
+
+	return models.NewNillableGenericValidationError(errors.Join(errs...))
+}
+
+// GetCreditFilters maps the charge's recorded attribution to concrete route dimensions.
+func (i Intent) GetCreditFilters(featureKey string) ledger.CreditFilters {
+	filters := ledger.CreditFilters{}
+	if featureKey != "" {
+		filters.Features = []string{featureKey}
+	}
+	if i.SubscriptionPlan != nil {
+		filters.Plans = []ledger.PlanFilter{{
+			Key:     i.SubscriptionPlan.Key,
+			Version: &ledger.VersionFilter{Eq: lo.ToPtr(i.SubscriptionPlan.Version)},
+		}}
+	}
+	return filters
+}

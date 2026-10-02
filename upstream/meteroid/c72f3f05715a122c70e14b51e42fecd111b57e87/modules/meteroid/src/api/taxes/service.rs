@@ -1,0 +1,289 @@
+use super::{TaxesServiceComponents, mapping};
+use common_domain::ids::{CustomTaxId, InvoicingEntityId, ProductId, TaxCategoryId};
+use common_grpc::middleware::server::auth::RequestExt;
+use meteroid_grpc::meteroid::api::taxes::v1::taxes_service_server::TaxesService;
+use meteroid_grpc::meteroid::api::taxes::v1::{
+    self as server, CreateTaxCategoryRequest, CreateTaxCategoryResponse, CreateTaxRateRequest,
+    CreateTaxRateResponse, DeleteTaxCategoryRequest, DeleteTaxRateRequest,
+    GetProductAccountingRequest, GetProductAccountingResponse, ListTaxCategoriesRequest,
+    ListTaxCategoriesResponse, ListTaxRatesRequest, ListTaxRatesResponse, UpdateTaxCategoryRequest,
+    UpdateTaxCategoryResponse, UpdateTaxRateRequest, UpdateTaxRateResponse,
+    UpsertProductAccountingRequest, UpsertProductAccountingResponse, ValidateVatNumberRequest,
+    ValidateVatNumberResponse,
+};
+use meteroid_store::repositories::accounting::AccountingInterface;
+use meteroid_store::repositories::tax_categories::TaxCategoryInterface;
+use tonic::{Request, Response, Status};
+
+#[tonic::async_trait]
+impl TaxesService for TaxesServiceComponents {
+    async fn create_tax_rate(
+        &self,
+        request: Request<CreateTaxRateRequest>,
+    ) -> Result<Response<CreateTaxRateResponse>, Status> {
+        let tenant_id = request.tenant()?;
+        let req = request.into_inner();
+
+        let custom_tax_new = mapping::custom_tax_new_from_server(
+            req.tax_rate
+                .ok_or_else(|| Status::invalid_argument("tax_rate is required"))?,
+        )
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        let custom_tax = self
+            .store
+            .insert_custom_tax(tenant_id, custom_tax_new)
+            .await
+            .map_err(mapping::tax_store_error_to_status)?;
+
+        Ok(Response::new(CreateTaxRateResponse {
+            tax_rate: Some(mapping::custom_tax_to_server(custom_tax)),
+        }))
+    }
+
+    async fn update_tax_rate(
+        &self,
+        request: Request<UpdateTaxRateRequest>,
+    ) -> Result<Response<UpdateTaxRateResponse>, Status> {
+        let tenant_id = request.tenant()?;
+        let req = request.into_inner();
+
+        let custom_tax = req
+            .tax_rate
+            .ok_or_else(|| Status::invalid_argument("tax_rate is required"))?;
+
+        let id = CustomTaxId::from_proto(custom_tax.id)?;
+        let invoicing_entity_id = InvoicingEntityId::from_proto(custom_tax.invoicing_entity_id)?;
+
+        let custom_tax_domain = meteroid_store::domain::accounting::TaxRate {
+            id,
+            invoicing_entity_id,
+            name: custom_tax.name,
+            tax_code: custom_tax.tax_code,
+            tax_category_id: mapping::tax_category_id_from_server(custom_tax.tax_category_id)?,
+            rules: custom_tax
+                .rules
+                .into_iter()
+                .map(mapping::tax_rule_from_server)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| Status::invalid_argument(e.to_string()))?,
+        };
+
+        let updated_tax = self
+            .store
+            .update_custom_tax(tenant_id, custom_tax_domain)
+            .await
+            .map_err(mapping::tax_store_error_to_status)?;
+
+        Ok(Response::new(UpdateTaxRateResponse {
+            tax_rate: Some(mapping::custom_tax_to_server(updated_tax)),
+        }))
+    }
+
+    async fn delete_tax_rate(
+        &self,
+        request: Request<DeleteTaxRateRequest>,
+    ) -> Result<Response<()>, Status> {
+        let tenant_id = request.tenant()?;
+        let req = request.into_inner();
+
+        let id = CustomTaxId::from_proto(req.id)?;
+
+        self.store
+            .delete_custom_tax(tenant_id, id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(()))
+    }
+
+    async fn list_tax_rates(
+        &self,
+        request: Request<ListTaxRatesRequest>,
+    ) -> Result<Response<ListTaxRatesResponse>, Status> {
+        let tenant_id = request.tenant()?;
+        let req = request.into_inner();
+
+        let invoicing_entity_id = InvoicingEntityId::from_proto(req.invoicing_entity_id)?;
+
+        let custom_taxes = self
+            .store
+            .list_custom_taxes_by_invoicing_entity_id(tenant_id, invoicing_entity_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(ListTaxRatesResponse {
+            tax_rates: custom_taxes
+                .into_iter()
+                .map(mapping::custom_tax_to_server)
+                .collect(),
+        }))
+    }
+
+    async fn upsert_product_accounting(
+        &self,
+        request: Request<UpsertProductAccountingRequest>,
+    ) -> Result<Response<UpsertProductAccountingResponse>, Status> {
+        let tenant_id = request.tenant()?;
+        let req = request.into_inner();
+
+        let product_accounting = mapping::product_accounting_from_server(
+            req.product_accounting
+                .ok_or_else(|| Status::invalid_argument("product_accounting is required"))?,
+        )
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        let result = self
+            .store
+            .upsert_product_accounting(tenant_id, product_accounting)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(UpsertProductAccountingResponse {
+            product_accounting: Some(mapping::product_accounting_to_server(result)),
+        }))
+    }
+
+    async fn get_product_accounting(
+        &self,
+        request: Request<GetProductAccountingRequest>,
+    ) -> Result<Response<GetProductAccountingResponse>, Status> {
+        let tenant_id = request.tenant()?;
+        let req = request.into_inner();
+
+        let product_id = ProductId::from_proto(req.product_id)?;
+        let invoicing_entity_id = InvoicingEntityId::from_proto(req.invoicing_entity_id)?;
+
+        let mut conn = self
+            .store
+            .get_conn()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let product_accountings = self
+            .store
+            .list_product_tax_configuration_by_product_ids_and_invoicing_entity_id_grouped(
+                &mut conn,
+                tenant_id,
+                vec![product_id],
+                invoicing_entity_id,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let product_accounting = product_accountings.into_iter().next().map(|pa| {
+            mapping::product_accounting_to_server(
+                meteroid_store::domain::accounting::ProductAccounting {
+                    product_id: pa.product_id,
+                    invoicing_entity_id: pa.invoicing_entity_id,
+                    product_code: pa.product_code,
+                    ledger_account_code: pa.ledger_account_code,
+                },
+            )
+        });
+
+        Ok(Response::new(GetProductAccountingResponse {
+            product_accounting,
+        }))
+    }
+
+    async fn validate_vat_number(
+        &self,
+        request: Request<ValidateVatNumberRequest>,
+    ) -> Result<Response<ValidateVatNumberResponse>, Status> {
+        let req = request.into_inner();
+
+        let is_valid = meteroid_tax::validation::validate_vat_number_format(&req.vat_number);
+
+        // TODO: Implement external VIES validation service call
+        let status = if is_valid {
+            server::validate_vat_number_response::ValidationStatus::Valid
+        } else {
+            server::validate_vat_number_response::ValidationStatus::Invalid
+        };
+
+        Ok(Response::new(ValidateVatNumberResponse {
+            is_valid,
+            status: status as i32,
+            company_name: None,
+            company_address: None,
+        }))
+    }
+
+    async fn list_tax_categories(
+        &self,
+        request: Request<ListTaxCategoriesRequest>,
+    ) -> Result<Response<ListTaxCategoriesResponse>, Status> {
+        let tenant_id = request.tenant()?;
+
+        let categories = self
+            .store
+            .list_tax_categories(tenant_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(ListTaxCategoriesResponse {
+            tax_categories: categories
+                .into_iter()
+                .map(mapping::tax_category_to_server)
+                .collect(),
+        }))
+    }
+
+    async fn create_tax_category(
+        &self,
+        request: Request<CreateTaxCategoryRequest>,
+    ) -> Result<Response<CreateTaxCategoryResponse>, Status> {
+        let tenant_id = request.tenant()?;
+        let req = request.into_inner();
+
+        let parent_id = mapping::tax_category_id_from_server(req.parent_id)?;
+
+        let category = self
+            .store
+            .create_tax_category(tenant_id, req.name, parent_id)
+            .await
+            .map_err(mapping::tax_store_error_to_status)?;
+
+        Ok(Response::new(CreateTaxCategoryResponse {
+            tax_category: Some(mapping::tax_category_to_server(category)),
+        }))
+    }
+
+    async fn update_tax_category(
+        &self,
+        request: Request<UpdateTaxCategoryRequest>,
+    ) -> Result<Response<UpdateTaxCategoryResponse>, Status> {
+        let tenant_id = request.tenant()?;
+        let req = request.into_inner();
+
+        let id = TaxCategoryId::from_proto(req.id)?;
+        let parent_id = mapping::tax_category_id_from_server(req.parent_id)?;
+
+        let category = self
+            .store
+            .update_tax_category(tenant_id, id, req.name, parent_id)
+            .await
+            .map_err(mapping::tax_store_error_to_status)?;
+
+        Ok(Response::new(UpdateTaxCategoryResponse {
+            tax_category: Some(mapping::tax_category_to_server(category)),
+        }))
+    }
+
+    async fn delete_tax_category(
+        &self,
+        request: Request<DeleteTaxCategoryRequest>,
+    ) -> Result<Response<()>, Status> {
+        let tenant_id = request.tenant()?;
+        let req = request.into_inner();
+
+        let id = TaxCategoryId::from_proto(req.id)?;
+
+        self.store
+            .delete_tax_category(tenant_id, id)
+            .await
+            .map_err(mapping::tax_store_error_to_status)?;
+
+        Ok(Response::new(()))
+    }
+}
