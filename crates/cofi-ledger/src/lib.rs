@@ -2,6 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+mod state;
+pub use state::{Account, AccountBalance, AccountKind, CommitOutcome, Ledger, LedgerStateError};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Side {
     Debit,
