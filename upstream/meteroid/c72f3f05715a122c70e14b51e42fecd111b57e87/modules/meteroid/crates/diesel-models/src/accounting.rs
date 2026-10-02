@@ -1,0 +1,48 @@
+use common_domain::ids::{CustomTaxId, InvoicingEntityId, ProductId, TaxCategoryId, TenantId};
+use diesel::{Identifiable, Insertable, Queryable, Selectable};
+
+#[derive(Clone, Debug, Identifiable, Queryable, Selectable, Insertable)]
+#[diesel(table_name = crate::schema::custom_tax)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct CustomTaxRow {
+    pub id: CustomTaxId,
+    pub invoicing_entity_id: InvoicingEntityId,
+    pub name: String,
+    pub tax_code: String,
+    pub rules: serde_json::Value,
+    /// When set, the tax applies to every line resolving to this category.
+    pub tax_category_id: Option<TaxCategoryId>,
+    /// Denormalized from `invoicing_entity` to enforce `tax_code` uniqueness
+    /// per tenant (the accounting code carried onto invoice tax breakdowns).
+    pub tenant_id: TenantId,
+}
+
+#[derive(Clone, Debug, Identifiable, Queryable, Selectable, Insertable)]
+#[diesel(primary_key(product_id, invoicing_entity_id))]
+#[diesel(table_name = crate::schema::product_accounting)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct ProductAccountingRow {
+    pub product_id: ProductId,
+    pub invoicing_entity_id: InvoicingEntityId,
+    pub product_code: Option<String>,
+    pub ledger_account_code: Option<String>,
+}
+
+#[derive(Clone, Debug, Identifiable, Queryable, Selectable, Insertable)]
+#[diesel(primary_key(product_id, invoicing_entity_id, custom_tax_id))]
+#[diesel(table_name = crate::schema::product_custom_tax)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct ProductCustomTaxRow {
+    pub product_id: ProductId,
+    pub invoicing_entity_id: InvoicingEntityId,
+    pub custom_tax_id: CustomTaxId,
+}
+
+#[derive(Debug, Queryable, Selectable)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct ProductAccountingWithTaxRow {
+    #[diesel(embed)]
+    pub product_accounting: ProductAccountingRow,
+    #[diesel(embed)]
+    pub custom_tax: Option<CustomTaxRow>,
+}

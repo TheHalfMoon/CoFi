@@ -1,0 +1,289 @@
+use crate::customer_payment_methods::{
+    CustomerPaymentMethodRow, CustomerPaymentMethodRowNew, CustomerPaymentMethodWithConnector,
+    ResolvedSubscriptionPaymentContext,
+};
+
+use crate::errors::IntoDbResult;
+use crate::{DbResult, PgConn};
+use common_domain::ids::{
+    ConnectorId, CustomerConnectionId, CustomerId, CustomerPaymentMethodId, SubscriptionId,
+    TenantId,
+};
+use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper, debug_query};
+use error_stack::ResultExt;
+
+impl CustomerPaymentMethodRow {
+    pub async fn delete(
+        conn: &mut PgConn,
+        id_param: &CustomerPaymentMethodId,
+        tenant_id_param: &TenantId,
+    ) -> DbResult<usize> {
+        use crate::schema::customer_payment_method::dsl::{customer_payment_method, id, tenant_id};
+        use diesel_async::RunQueryDsl;
+
+        let query = diesel::delete(customer_payment_method)
+            .filter(id.eq(id_param))
+            .filter(tenant_id.eq(tenant_id_param));
+        log::debug!("{}", debug_query::<diesel::pg::Pg, _>(&query));
+
+        query
+            .execute(conn)
+            .await
+            .attach("Error while deleting customer payment method")
+            .into_db_result()
+    }
+
+    pub async fn get_by_id(
+        conn: &mut PgConn,
+        tenant_id_param: &TenantId,
+        payment_method_id_param: &CustomerPaymentMethodId,
+    ) -> DbResult<CustomerPaymentMethodRow> {
+        use crate::schema::customer_payment_method::dsl as cpm_dsl;
+        use diesel_async::RunQueryDsl;
+
+        let query = cpm_dsl::customer_payment_method
+            .filter(cpm_dsl::id.eq(payment_method_id_param))
+            .filter(cpm_dsl::tenant_id.eq(tenant_id_param))
+            .select(CustomerPaymentMethodRow::as_select());
+        log::debug!("{}", debug_query::<diesel::pg::Pg, _>(&query));
+
+        query
+            .get_result(conn)
+            .await
+            .attach("Error while finding customer payment method by id")
+            .into_db_result()
+    }
+
+    /// Resolve a method by the provider's payment-method id (mandate id),
+    /// scoped to the tenant. Used by detach webhooks (mandate cancelled).
+    pub async fn get_by_external_id(
+        conn: &mut PgConn,
+        tenant_id_param: &TenantId,
+        external_payment_method_id_param: &str,
+    ) -> DbResult<Option<CustomerPaymentMethodRow>> {
+        use crate::schema::customer_payment_method::dsl as cpm_dsl;
+        use diesel_async::RunQueryDsl;
+
+        let query = cpm_dsl::customer_payment_method
+            .filter(cpm_dsl::external_payment_method_id.eq(external_payment_method_id_param))
+            .filter(cpm_dsl::tenant_id.eq(tenant_id_param))
+            .select(CustomerPaymentMethodRow::as_select());
+        log::debug!("{}", debug_query::<diesel::pg::Pg, _>(&query));
+
+        query
+            .first(conn)
+            .await
+            .optional()
+            .attach("Error while finding customer payment method by external id")
+            .into_db_result()
+    }
+
+    /// Soft-archive a method (kept for historical transactions' FK). Only sets
+    /// `archived_at` when still null, so redeliveries preserve the first stamp.
+    pub async fn archive(
+        conn: &mut PgConn,
+        tenant_id_param: &TenantId,
+        id_param: &CustomerPaymentMethodId,
+    ) -> DbResult<usize> {
+        use crate::schema::customer_payment_method::dsl as cpm_dsl;
+        use diesel_async::RunQueryDsl;
+
+        let query = diesel::update(cpm_dsl::customer_payment_method)
+            .filter(cpm_dsl::id.eq(id_param))
+            .filter(cpm_dsl::tenant_id.eq(tenant_id_param))
+            .filter(cpm_dsl::archived_at.is_null())
+            .set((
+                cpm_dsl::archived_at.eq(diesel::dsl::now),
+                cpm_dsl::updated_at.eq(diesel::dsl::now),
+            ));
+        log::debug!("{}", debug_query::<diesel::pg::Pg, _>(&query));
+
+        query
+            .execute(conn)
+            .await
+            .attach("Error while archiving customer payment method")
+            .into_db_result()
+    }
+
+    pub async fn get_subscription_payment_context(
+        conn: &mut PgConn,
+        tenant_id_param: TenantId,
+        subscription_id_param: SubscriptionId,
+    ) -> DbResult<ResolvedSubscriptionPaymentContext> {
+        use crate::schema::customer::dsl as cust_dsl;
+        use crate::schema::invoicing_entity::dsl as ie_dsl;
+        use crate::schema::subscription::dsl as sub_dsl;
+        use diesel_async::RunQueryDsl;
+
+        let query = sub_dsl::subscription
+            .inner_join(cust_dsl::customer.inner_join(ie_dsl::invoicing_entity))
+            .filter(sub_dsl::id.eq(subscription_id_param))
+            .filter(sub_dsl::tenant_id.eq(tenant_id_param))
+            .select(ResolvedSubscriptionPaymentContext::as_select());
+        log::debug!("{}", debug_query::<diesel::pg::Pg, _>(&query));
+
+        query
+            .get_result(conn)
+            .await
+            .attach("Error while fetching payment context for subscription")
+            .into_db_result()
+    }
+
+    pub async fn list_customer_payment_methods_by_providers(
+        conn: &mut PgConn,
+        tenant_id_param: &TenantId,
+        customer_id_param: &CustomerId,
+        provider_ids: &[ConnectorId],
+    ) -> DbResult<Vec<CustomerPaymentMethodWithConnector>> {
+        use crate::schema::customer_connection::dsl as cc_dsl;
+        use crate::schema::customer_payment_method::dsl as cpm_dsl;
+        use diesel_async::RunQueryDsl;
+
+        if provider_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let query = cpm_dsl::customer_payment_method
+            .inner_join(cc_dsl::customer_connection)
+            .filter(cpm_dsl::customer_id.eq(customer_id_param))
+            .filter(cpm_dsl::tenant_id.eq(tenant_id_param))
+            .filter(cpm_dsl::archived_at.is_null())
+            .filter(cc_dsl::connector_id.eq_any(provider_ids))
+            .select(CustomerPaymentMethodWithConnector::as_select());
+        log::debug!("{}", debug_query::<diesel::pg::Pg, _>(&query));
+
+        query
+            .get_results(conn)
+            .await
+            .attach("Error while listing customer payment methods by providers")
+            .into_db_result()
+    }
+
+    pub async fn list_by_connection_id(
+        conn: &mut PgConn,
+        tenant_id_param: &TenantId,
+        connection_id_param: &CustomerConnectionId,
+    ) -> DbResult<Vec<CustomerPaymentMethodRow>> {
+        use crate::schema::customer_payment_method::dsl as cpm_dsl;
+        use diesel_async::RunQueryDsl;
+
+        let query = cpm_dsl::customer_payment_method
+            .filter(cpm_dsl::connection_id.eq(connection_id_param))
+            .filter(cpm_dsl::tenant_id.eq(tenant_id_param))
+            .select(CustomerPaymentMethodRow::as_select());
+        log::debug!("{}", debug_query::<diesel::pg::Pg, _>(&query));
+
+        query
+            .get_results(conn)
+            .await
+            .attach("Error while finding customer payment methods by connection id")
+            .into_db_result()
+    }
+
+    pub async fn list_by_customer_id(
+        conn: &mut PgConn,
+        tenant_id_param: &TenantId,
+        customer_id_param: &CustomerId,
+    ) -> DbResult<Vec<CustomerPaymentMethodRow>> {
+        use crate::schema::customer_payment_method::dsl as cpm_dsl;
+        use diesel_async::RunQueryDsl;
+
+        let query = cpm_dsl::customer_payment_method
+            .filter(cpm_dsl::customer_id.eq(customer_id_param))
+            .filter(cpm_dsl::tenant_id.eq(tenant_id_param))
+            .select(CustomerPaymentMethodRow::as_select());
+        log::debug!("{}", debug_query::<diesel::pg::Pg, _>(&query));
+
+        query
+            .get_results(conn)
+            .await
+            .attach("Error while finding customer payment methods by connection id")
+            .into_db_result()
+    }
+
+    /// Refresh card brand/last4/expiry for a stored method, keyed by the
+    /// provider's payment-method id (used by the `payment_method.updated`
+    /// webhook). Returns the number of rows updated.
+    pub async fn update_card_details(
+        conn: &mut PgConn,
+        tenant_uid: TenantId,
+        external_payment_method_id_param: &str,
+        brand: Option<String>,
+        last4: Option<String>,
+        exp_month: Option<i32>,
+        exp_year: Option<i32>,
+    ) -> DbResult<usize> {
+        use crate::schema::customer_payment_method::dsl as cpm;
+        use diesel_async::RunQueryDsl;
+
+        let query = diesel::update(
+            cpm::customer_payment_method
+                .filter(cpm::tenant_id.eq(tenant_uid))
+                .filter(cpm::external_payment_method_id.eq(external_payment_method_id_param)),
+        )
+        .set((
+            cpm::card_brand.eq(brand),
+            cpm::card_last4.eq(last4),
+            cpm::card_exp_month.eq(exp_month),
+            cpm::card_exp_year.eq(exp_year),
+            cpm::updated_at.eq(diesel::dsl::now),
+        ));
+        log::debug!("{}", debug_query::<diesel::pg::Pg, _>(&query));
+
+        query
+            .execute(conn)
+            .await
+            .attach("Error while updating payment method card details")
+            .into_db_result()
+    }
+}
+
+impl CustomerPaymentMethodRowNew {
+    /// Insert, or refresh the row with the same provider id.
+    pub async fn upsert(&self, conn: &mut PgConn) -> DbResult<CustomerPaymentMethodRow> {
+        use crate::schema::customer_payment_method::dsl as cpm_dsl;
+        use diesel_async::RunQueryDsl;
+
+        let query = diesel::insert_into(cpm_dsl::customer_payment_method)
+            .values(self)
+            .on_conflict((cpm_dsl::connection_id, cpm_dsl::external_payment_method_id))
+            .do_update()
+            .set((self, cpm_dsl::updated_at.eq(diesel::dsl::now)));
+        log::debug!("{}", debug_query::<diesel::pg::Pg, _>(&query));
+
+        query
+            .get_result(conn)
+            .await
+            .attach("Error while upserting customer payment method")
+            .into_db_result()
+    }
+
+    /// Upserts on the active `(connection, type, fingerprint)` row, adopting the new provider id.
+    /// The partial unique index makes concurrent inserts converge. Requires `fingerprint`.
+    pub async fn upsert_by_fingerprint(
+        &self,
+        conn: &mut PgConn,
+    ) -> DbResult<CustomerPaymentMethodRow> {
+        use crate::schema::customer_payment_method::dsl as cpm_dsl;
+        use diesel::upsert::DecoratableTarget;
+        use diesel_async::RunQueryDsl;
+
+        let query = diesel::insert_into(cpm_dsl::customer_payment_method)
+            .values(self)
+            .on_conflict((
+                cpm_dsl::connection_id,
+                cpm_dsl::payment_method_type,
+                cpm_dsl::fingerprint,
+            ))
+            .filter_target(cpm_dsl::archived_at.is_null())
+            .do_update()
+            .set((self, cpm_dsl::updated_at.eq(diesel::dsl::now)));
+        log::debug!("{}", debug_query::<diesel::pg::Pg, _>(&query));
+
+        query
+            .get_result(conn)
+            .await
+            .attach("Error while upserting customer payment method by fingerprint")
+            .into_db_result()
+    }
+}

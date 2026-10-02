@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+package meteroid.api.taxes.v1;
+
+message TaxRate {
+  string id = 1;
+  string invoicing_entity_id = 2;
+  string name = 3;
+  string tax_code = 4;
+  repeated TaxRateRule rules = 5;
+  // When set, the tax applies to every line resolving to this category.
+  optional string tax_category_id = 6;
+}
+
+// A provider-agnostic classification of what is sold. Built-in rows are global
+// (no tenant_id); tenant-custom categories carry a tenant_id. Categories are
+// standard-rated by default; the `nontaxable` key is exempt.
+message TaxCategory {
+  string id = 1;
+  optional string tenant_id = 2;
+  optional string parent_id = 3;
+  string key = 4;
+  string name = 5;
+  bool is_builtin = 6;
+}
+
+message TaxRateRule {
+  optional string country = 1;
+  optional string region = 2;
+  string rate = 3; // Decimal
+}
+
+message TaxRateNew {
+  string invoicing_entity_id = 1;
+  string name = 2;
+  string tax_code = 3;
+  repeated TaxRateRule rules = 4;
+  optional string tax_category_id = 5;
+}
+
+message ProductAccounting {
+  string product_id = 1;
+  string invoicing_entity_id = 2;
+  optional string product_code = 3;
+  optional string ledger_account_code = 4;
+}
+
+message ValidateVatNumberRequest {
+  string vat_number = 1;
+  optional string country = 2;
+}
+
+message ValidateVatNumberResponse {
+  bool is_valid = 1;
+  ValidationStatus status = 2;
+  optional string company_name = 3;
+  optional string company_address = 4;
+
+  enum ValidationStatus {
+    VALID = 0;
+    INVALID = 1;
+    SERVICE_UNAVAILABLE = 2;
+  }
+}

@@ -1,0 +1,128 @@
+syntax = "proto3";
+
+package meteroid.api.connectors.v1;
+
+
+enum ConnectorProviderEnum {
+  STRIPE = 0;
+  HUBSPOT = 1;
+  PENNYLANE = 2;
+  GOCARDLESS = 3;
+  STANCER = 4;
+  MOLLIE = 5;
+}
+
+enum ConnectorTypeEnum {
+  PAYMENT_PROVIDER = 0;
+  CRM = 1;
+  ACCOUNTING = 2;
+  TAX = 3;
+}
+
+message ConnectorData {
+  oneof data {
+    HubspotConnectorData hubspot = 1;
+    PennylaneConnectorData pennylane = 2;
+  }
+}
+
+// How a payment method is set up. The frontend picks its UI from this, not from the provider.
+enum MandateSetupMode {
+  // Provider returns a client secret; the frontend mounts an embedded SDK.
+  EMBEDDED_CLIENT_SECRET = 0;
+  // Provider returns an authorisation URL; the frontend redirects the browser.
+  HOSTED_REDIRECT = 1;
+  // Provider returns opaque session data; the frontend mounts a drop-in widget.
+  EMBEDDED_DROP_IN = 2;
+}
+
+// How a hosted-redirect setup's completion reaches the backend.
+enum HostedSetupCompletion {
+  // A webhook covers lost returns.
+  WEBHOOK_BACKED = 0;
+  // Only the return redirect signals completion; a sweeper polls lost returns.
+  POLLING_REQUIRED = 1;
+}
+
+// What a payment provider can do (mirrors backend `ConnectorCapabilities`). Absent on
+// non-payment connectors.
+message PaymentProviderCapabilities {
+  bool supports_cards = 1;
+  bool supports_direct_debit = 2;
+  MandateSetupMode mandate_setup_mode = 3;
+  HostedSetupCompletion hosted_setup_completion = 4;
+  // The hosted page collects the invoice amount with the method, so the payment is created on
+  // the pay click, not on render.
+  bool supports_hosted_invoice_payment = 5;
+  // The checkout's first payment is collected in the same hosted flow as the mandate.
+  bool supports_hosted_checkout = 6;
+  // Charges settle later via webhook or reconciliation.
+  bool asynchronous_settlement = 7;
+}
+
+message Connector {
+  string id = 1;
+  string alias = 2;
+  ConnectorProviderEnum provider = 3;
+  ConnectorTypeEnum connector_type = 4;
+  optional ConnectorData data = 5;
+  optional PaymentProviderCapabilities payment_capabilities = 6;
+}
+
+// we could add some Stripe Connect to simplify cloud onboarding later
+message StripeConnector {
+  string alias = 1;
+  string api_publishable_key = 4;
+  string api_secret_key = 5;
+  string webhook_secret = 6;
+}
+
+// Stancer card connector. The secret key alone authenticates every call;
+// test vs live mode rides on the key prefix (`stest_…` / `sprod_…`). No
+// webhook mechanism, so no webhook secret.
+message StancerConnector {
+  string alias = 1;
+  string api_secret_key = 2;
+}
+
+// Mollie: the API key is the only credential; its prefix selects test/live. Webhooks are
+// per payment, authenticated by a server-generated URL token.
+message MollieConnector {
+  string alias = 1;
+  string api_key = 2;
+}
+
+message HubspotConnectorData {
+  bool auto_sync = 1;
+  string external_company_id = 2;
+}
+
+message PennylaneConnectorData {
+  string external_company_id = 1;
+}
+
+// GoCardless connector. Mandate-based bank-debit provider; merchants manage
+// webhook endpoints in the GoCardless dashboard (the API doesn't expose
+// programmatic endpoint creation), so we ask for the signing secret
+// directly. `creditor_id` is required when the access token has access to
+// multiple creditors; optional otherwise. `environment` selects sandbox vs
+// live API base URLs.
+message GoCardlessConnector {
+  string alias = 1;
+  string access_token = 2;
+  string webhook_secret = 3;
+  optional string creditor_id = 4;
+  string environment = 5;  // "sandbox" or "live"
+}
+
+message ConnectionMetadata {
+  repeated ConnectionMetadataItem hubspot = 1;
+  repeated ConnectionMetadataItem pennylane = 2;
+}
+
+message ConnectionMetadataItem {
+  string connector_id = 1;
+  string external_id = 2;
+  string sync_at = 3;
+  string external_company_id = 4;
+}

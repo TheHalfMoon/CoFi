@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package meteroid.portal.shared.v1;
+
+import "portal/shared/v1/models.proto";
+import "api/customers/v1/models.proto";
+
+
+message UpdateCustomerRequest {
+  UpdateCustomer customer = 1;
+}
+message UpdateCustomerResponse {
+  api.customers.v1.Customer customer = 1;
+}
+
+message SetupIntentRequest {
+  optional string connection_id = 1;
+  ConnectionTypeEnum connection_type = 2;
+  // For hosted-redirect providers (GoCardless): where the provider should
+  // redirect the customer's browser after the hosted flow completes. The
+  // backend forwards this verbatim to the provider. Ignored for embedded
+  // providers (Stripe).
+  optional string return_url = 3;
+  // When the setup is initiated to pay a specific invoice (invoice-payment
+  // page), the invoice id. For hosted-redirect providers the charge can only
+  // happen after the mandate exists, so the return handler uses this to charge
+  // the invoice once setup completes. Absent for plain "add a payment method".
+  optional string invoice_id = 4;
+  // Mollie/Stancer: return only a provider descriptor without creating a hosted payment (the pay
+  // button does that). Ignored for other providers.
+  optional bool descriptor_only = 5;
+}
+message SetupIntentResponse {
+  SetupIntent setup_intent = 1;
+}
+
+message AddPaymentMethodRequest {
+  string connection_id = 1;
+  string external_payment_method_id = 2;
+}
+message AddPaymentMethodResponse {
+  api.customers.v1.CustomerPaymentMethod payment_method = 1;
+}
+
+message SetDefaultPaymentMethodRequest {
+  string payment_method_id = 1;
+}
+message SetDefaultPaymentMethodResponse {
+  api.customers.v1.Customer customer = 1;
+}
+
+service PortalSharedService {
+  rpc UpdateCustomer(UpdateCustomerRequest) returns (UpdateCustomerResponse);
+  rpc SetupIntent(SetupIntentRequest) returns (SetupIntentResponse);
+  rpc AddPaymentMethod(AddPaymentMethodRequest) returns (AddPaymentMethodResponse);
+  rpc SetDefaultPaymentMethod(SetDefaultPaymentMethodRequest) returns (SetDefaultPaymentMethodResponse);
+}

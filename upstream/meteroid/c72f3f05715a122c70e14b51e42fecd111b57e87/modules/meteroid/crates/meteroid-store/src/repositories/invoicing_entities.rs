@@ -1,0 +1,425 @@
+use crate::StoreResult;
+use crate::adapters::payment::initialize_payment_connector;
+use crate::domain::entity_activity::{Activity, ActivityType, Actor, AuditInput, EntityType};
+use crate::domain::invoicing_entities::InvoicingEntity;
+use crate::domain::{
+    InvoicingEntityNew, InvoicingEntityPatch, InvoicingEntityProviders,
+    InvoicingEntityProvidersPatch, TaxResolverEnum,
+};
+use crate::errors::StoreError;
+use crate::repositories::connectors::ConnectorsInterface;
+use crate::store::{PgConn, Store, StoreInternal};
+use common_domain::country::CountryCode;
+use common_domain::ids::{BaseId, InvoicingEntityId, OrganizationId, TaxCategoryId, TenantId};
+use uuid::uuid;
+
+/// Built-in "Digital services" tax category (seeded, standard-rated) — the default
+/// classification for a new invoicing entity on this SaaS-first platform. Keep in
+/// sync with the tax_categories migration seed.
+const DIGITAL_SERVICES_TAX_CATEGORY_ID: TaxCategoryId =
+    TaxCategoryId::from_const(uuid!("a0000000-0000-4000-8000-000000000004"));
+use diesel_models::invoicing_entities::{
+    InvoicingEntityProvidersRow, InvoicingEntityRow, InvoicingEntityRowPatch,
+    InvoicingEntityRowProvidersPatch,
+};
+use diesel_models::organizations::OrganizationRow;
+use diesel_models::tax_categories::TaxCategoryRow;
+use diesel_models::tenants::TenantRow;
+use error_stack::Report;
+use meteroid_store_macros::with_conn_delegate;
+use scoped_futures::ScopedFutureExt;
+
+#[with_conn_delegate]
+#[async_trait::async_trait]
+pub trait InvoicingEntityInterface {
+    async fn list_invoicing_entities(
+        &self,
+        tenant_id: TenantId,
+    ) -> StoreResult<Vec<InvoicingEntity>>;
+
+    async fn list_invoicing_entities_by_ids(
+        &self,
+        ids: Vec<InvoicingEntityId>,
+    ) -> StoreResult<Vec<InvoicingEntity>>;
+
+    #[delegated]
+    async fn get_invoicing_entity(
+        &self,
+        tenant_id: TenantId,
+        invoicing_id_or_default: Option<InvoicingEntityId>,
+    ) -> StoreResult<InvoicingEntity>;
+
+    async fn create_invoicing_entity(
+        &self,
+        invoicing_entity: InvoicingEntityNew,
+        tenant_id: TenantId,
+        organization_id: OrganizationId,
+    ) -> StoreResult<InvoicingEntity>;
+    async fn patch_invoicing_entity(
+        &self,
+        actor: Actor,
+        invoicing_entity: InvoicingEntityPatch,
+        tenant_id: TenantId,
+    ) -> StoreResult<InvoicingEntity>;
+
+    async fn patch_invoicing_entity_providers(
+        &self,
+        invoicing_entity: InvoicingEntityProvidersPatch,
+        tenant_id: TenantId,
+    ) -> StoreResult<InvoicingEntityProviders>;
+
+    async fn resolve_providers_by_id(
+        &self,
+        tenant_id: TenantId,
+        id: InvoicingEntityId,
+    ) -> StoreResult<InvoicingEntityProviders>;
+}
+
+#[async_trait::async_trait]
+impl InvoicingEntityInterface for Store {
+    async fn list_invoicing_entities(
+        &self,
+        tenant_id: TenantId,
+    ) -> StoreResult<Vec<InvoicingEntity>> {
+        let mut conn = self.get_conn().await?;
+
+        let invoicing_entities = InvoicingEntityRow::list_by_tenant_id(&mut conn, tenant_id)
+            .await
+            .map_err(Into::<Report<StoreError>>::into)?
+            .into_iter()
+            .map(std::convert::Into::into)
+            .collect();
+
+        Ok(invoicing_entities)
+    }
+
+    async fn list_invoicing_entities_by_ids(
+        &self,
+        ids: Vec<InvoicingEntityId>,
+    ) -> StoreResult<Vec<InvoicingEntity>> {
+        let mut conn = self.get_conn().await?;
+
+        let invoicing_entities = InvoicingEntityRow::list_by_ids(&mut conn, ids)
+            .await
+            .map_err(Into::<Report<StoreError>>::into)?
+            .into_iter()
+            .map(std::convert::Into::into)
+            .collect();
+
+        Ok(invoicing_entities)
+    }
+
+    async fn get_invoicing_entity_with_conn(
+        &self,
+        conn: &mut PgConn,
+        tenant_id: TenantId,
+        invoicing_id_or_default: Option<InvoicingEntityId>,
+    ) -> StoreResult<InvoicingEntity> {
+        let invoicing_entity = match invoicing_id_or_default {
+            Some(invoicing_id) => InvoicingEntityRow::get_invoicing_entity_by_id_and_tenant(
+                conn,
+                invoicing_id,
+                tenant_id,
+            )
+            .await
+            .map_err(Into::<Report<StoreError>>::into)?
+            .into(),
+            None => InvoicingEntityRow::get_default_invoicing_entity_for_tenant(conn, tenant_id)
+                .await
+                .map_err(Into::<Report<StoreError>>::into)?
+                .into(),
+        };
+
+        Ok(invoicing_entity)
+    }
+
+    async fn create_invoicing_entity(
+        &self,
+        invoicing_entity: InvoicingEntityNew,
+        tenant_id: TenantId,
+        organization_id: OrganizationId,
+    ) -> StoreResult<InvoicingEntity> {
+        let mut conn = self.get_conn().await?;
+
+        let organization = OrganizationRow::get_by_id(&mut conn, organization_id)
+            .await
+            .map_err(Into::<Report<StoreError>>::into)?;
+
+        self.internal
+            .create_invoicing_entity(
+                &mut conn,
+                invoicing_entity,
+                tenant_id,
+                organization.default_country,
+                organization.trade_name,
+            )
+            .await
+    }
+
+    async fn patch_invoicing_entity(
+        &self,
+        actor: Actor,
+        invoicing_entity: InvoicingEntityPatch,
+        tenant_id: TenantId,
+    ) -> StoreResult<InvoicingEntity> {
+        let mut conn = self.get_conn().await?;
+
+        let mut row: InvoicingEntityRowPatch = invoicing_entity.into();
+        let entity_id = row.id;
+
+        if let Some(Some(category_id)) = row.default_tax_category_id {
+            let available =
+                TaxCategoryRow::is_available_for_tenant(&mut conn, category_id, tenant_id)
+                    .await
+                    .map_err(Into::<Report<StoreError>>::into)?;
+            if !available {
+                return Err(Report::new(StoreError::InvalidArgument(
+                    "default_tax_category_id is not a tax category available to this tenant"
+                        .to_string(),
+                )));
+            }
+        }
+
+        if row.country.is_some() {
+            let is_in_use = InvoicingEntityRow::is_in_use(&mut conn, row.id, tenant_id)
+                .await
+                .map_err(Into::<Report<StoreError>>::into)?;
+            // we don't allow country changes if already in use
+            if is_in_use {
+                row.country = None;
+            } else {
+                let currency = self
+                    .internal
+                    .get_currency_from_country(&row.country.clone().unwrap())?;
+                row.accounting_currency = Some(currency);
+            }
+        }
+
+        // Validate the tax resolver against the EFFECTIVE post-patch state (a
+        // country change applied in this same patch must be honoured): the built-in
+        // EU VAT engine is EU-seller-only, and an external tax provider may only be
+        // referenced under the External resolver. `row.country` is the applied new
+        // country (nulled above if the entity is already in use), else unchanged.
+        if let Some(new_resolver) = row.tax_resolver.clone() {
+            let current = InvoicingEntityRow::get_invoicing_entity_by_id_and_tenant(
+                &mut conn, entity_id, tenant_id,
+            )
+            .await
+            .map_err(Into::<Report<StoreError>>::into)?;
+
+            let effective_country = row
+                .country
+                .clone()
+                .unwrap_or_else(|| current.country.clone());
+
+            if matches!(
+                new_resolver,
+                diesel_models::enums::TaxResolverEnum::MeteroidEuVat
+            ) && !world_tax::is_eu_seller_country(&effective_country.code)
+            {
+                return Err(Report::new(StoreError::InvalidArgument(
+                    "Meteroid EU VAT is available to EU sellers only; use an external tax provider for non-EU sellers"
+                        .to_string(),
+                )));
+            }
+
+            if !matches!(
+                new_resolver,
+                diesel_models::enums::TaxResolverEnum::External
+            ) && current.tax_provider_id.is_some()
+            {
+                return Err(Report::new(StoreError::InvalidArgument(
+                    "tax_provider_id is only valid with the External tax resolver".to_string(),
+                )));
+            }
+        }
+
+        let res: InvoicingEntityRow = self
+            .transaction(|conn| {
+                let actor = &actor;
+                async move {
+                    let res = row
+                        .patch_invoicing_entity(conn, tenant_id)
+                        .await
+                        .map_err(Into::<Report<StoreError>>::into)?;
+
+                    let activity = Activity::new(
+                        ActivityType::EntityUpdated,
+                        EntityType::InvoicingEntity,
+                        entity_id.as_uuid(),
+                    );
+                    self.internal
+                        .record_audit_tx(conn, tenant_id, actor, AuditInput::Activity(activity))
+                        .await?;
+
+                    Ok(res)
+                }
+                .scope_boxed()
+            })
+            .await?;
+
+        Ok(res.into())
+    }
+
+    async fn patch_invoicing_entity_providers(
+        &self,
+        invoicing_entity: InvoicingEntityProvidersPatch,
+        tenant_id: TenantId,
+    ) -> StoreResult<InvoicingEntityProviders> {
+        let mut conn = self.get_conn().await?;
+
+        // Enforce provider capabilities before persisting: a connector assigned
+        // to a slot must actually support that payment rail. Otherwise the
+        // misconfiguration is invisible until a customer tries to pay and the
+        // charge/mandate fails at the provider (e.g. GoCardless has no card
+        // support, so it must never land in the card slot).
+        for (slot, requires_cards, label) in [
+            (invoicing_entity.card_provider_id, true, "card payments"),
+            (
+                invoicing_entity.direct_debit_provider_id,
+                false,
+                "direct debit",
+            ),
+        ] {
+            if let Some(Some(connector_id)) = slot {
+                let connector = self
+                    .get_connector_with_data(connector_id, tenant_id)
+                    .await?;
+                let capabilities = initialize_payment_connector(&connector)
+                    .map_err(|_| {
+                        Report::new(StoreError::InvalidArgument(format!(
+                            "{:?} is not a payment provider",
+                            connector.provider
+                        )))
+                    })?
+                    .capabilities()
+                    .clone();
+
+                let supported = if requires_cards {
+                    capabilities.supports_cards
+                } else {
+                    // "Supports direct debit" means an actual DD rail: a
+                    // card-only provider also has supports_mandates (a saved
+                    // card is a reusable mandate) but must never land here.
+                    capabilities.supported_payment_methods.iter().any(|m| {
+                        matches!(
+                            m,
+                            crate::domain::PaymentMethodTypeEnum::DirectDebitSepa
+                                | crate::domain::PaymentMethodTypeEnum::DirectDebitAch
+                                | crate::domain::PaymentMethodTypeEnum::DirectDebitBacs
+                        )
+                    })
+                };
+
+                if !supported {
+                    return Err(Report::new(StoreError::InvalidArgument(format!(
+                        "{:?} does not support {label} and cannot be assigned to that slot",
+                        connector.provider
+                    ))));
+                }
+            }
+        }
+
+        let row: InvoicingEntityRowProvidersPatch = invoicing_entity.into();
+
+        let patched = row
+            .patch_invoicing_entity_providers(&mut conn, tenant_id)
+            .await
+            .map_err(Into::<Report<StoreError>>::into)?;
+
+        let res =
+            InvoicingEntityProvidersRow::resolve_providers_by_id(&mut conn, patched.id, tenant_id)
+                .await
+                .map_err(Into::<Report<StoreError>>::into)?;
+
+        Ok(res.into())
+    }
+
+    async fn resolve_providers_by_id(
+        &self,
+        tenant_id: TenantId,
+        id: InvoicingEntityId,
+    ) -> StoreResult<InvoicingEntityProviders> {
+        let mut conn = self.get_conn().await?;
+
+        let res = InvoicingEntityProvidersRow::resolve_providers_by_id(&mut conn, id, tenant_id)
+            .await
+            .map_err(Into::<Report<StoreError>>::into)?;
+
+        Ok(res.into())
+    }
+}
+
+impl StoreInternal {
+    pub async fn create_invoicing_entity(
+        &self,
+        conn: &mut PgConn,
+        invoicing_entity: InvoicingEntityNew,
+        tenant_id: TenantId,
+        default_country: CountryCode,
+        trade_name: String,
+    ) -> StoreResult<InvoicingEntity> {
+        let other_exists = InvoicingEntityRow::exists_any_for_tenant(conn, tenant_id)
+            .await
+            .map_err(Into::<Report<StoreError>>::into)?;
+
+        let country = invoicing_entity
+            .country
+            .clone()
+            .unwrap_or(default_country.clone());
+
+        let currency = self.get_currency_from_country(&country)?;
+
+        let entity = InvoicingEntity {
+            id: InvoicingEntityId::new(),
+            is_default: !other_exists,
+            legal_name: invoicing_entity.legal_name.unwrap_or(trade_name),
+            invoice_number_pattern: invoicing_entity
+                .invoice_number_pattern
+                .unwrap_or("INV-{number}".to_string()),
+            next_invoice_number: 1,
+            next_credit_note_number: 1,
+            grace_period_hours: invoicing_entity.grace_period_hours.unwrap_or(24),
+            net_terms: invoicing_entity.net_terms.unwrap_or(30),
+            invoice_footer_info: invoicing_entity.invoice_footer_info.clone(),
+            invoice_footer_legal: invoicing_entity.invoice_footer_legal.clone(),
+            logo_attachment_id: invoicing_entity.logo_attachment_id,
+            brand_color: invoicing_entity.brand_color.clone(),
+            address_line1: invoicing_entity.address_line1.clone(),
+            address_line2: invoicing_entity.address_line2.clone(),
+            zip_code: invoicing_entity.zip_code.clone(),
+            state: invoicing_entity.state.clone(),
+            city: invoicing_entity.city.clone(),
+            vat_number: invoicing_entity.vat_number.clone(),
+            country,
+            accounting_currency: currency.clone(),
+            tenant_id,
+            card_provider_id: None,
+            direct_debit_provider_id: None,
+            bank_account_id: None,
+            tax_resolver: TaxResolverEnum::Manual,
+            require_vies_valid_for_reverse_charge: invoicing_entity
+                .require_vies_valid_for_reverse_charge
+                .unwrap_or(false),
+            require_billing_information: invoicing_entity.require_billing_information,
+            portal_theme_mode: invoicing_entity.portal_theme_mode.clone(),
+            portal_roundness: invoicing_entity.portal_roundness.clone(),
+            default_tax_category_id: Some(DIGITAL_SERVICES_TAX_CATEGORY_ID),
+            tax_provider_id: None,
+        };
+
+        let row: InvoicingEntityRow = entity.into();
+
+        let invoicing_entity_row = row
+            .insert(conn)
+            .await
+            .map_err(Into::<Report<StoreError>>::into)?;
+
+        // Add the currency to tenant's available_currencies if not already present
+        TenantRow::add_currency_if_missing(conn, tenant_id, currency)
+            .await
+            .map_err(Into::<Report<StoreError>>::into)?;
+
+        Ok(invoicing_entity_row.into())
+    }
+}
