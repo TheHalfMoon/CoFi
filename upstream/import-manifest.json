@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "project": "Community Finance",
+  "brand": "CoFi",
+  "donors": [
+    {"name":"meteroid","repository":"meteroid-oss/meteroid","commit":"c72f3f05715a122c70e14b51e42fecd111b57e87","path":"upstream/meteroid/c72f3f05715a122c70e14b51e42fecd111b57e87"},
+    {"name":"lago","repository":"getlago/lago","commit":"a0de065beab237f357f033c6aa92058ebd417d5c","path":"upstream/lago/a0de065beab237f357f033c6aa92058ebd417d5c"},
+    {"name":"openmeter","repository":"openmeterio/openmeter","commit":"cebcd9f8b9f6a1b5cf473d3bb7065450549b4240","path":"upstream/openmeter/cebcd9f8b9f6a1b5cf473d3bb7065450549b4240"},
+    {"name":"hyperswitch","repository":"juspay/hyperswitch","commit":"d03f8547d6367fab56690e4f5043590be4935dcd","path":"upstream/hyperswitch/d03f8547d6367fab56690e4f5043590be4935dcd"}
+  ]
+}
