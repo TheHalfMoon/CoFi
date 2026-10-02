@@ -159,6 +159,7 @@ impl Posting {
 pub struct EntryMetadata {
     correlation_id: Option<String>,
     idempotency_key: Option<String>,
+    business_key: Option<String>,
 }
 
 impl EntryMetadata {
@@ -172,6 +173,7 @@ impl EntryMetadata {
         Ok(Self {
             correlation_id,
             idempotency_key,
+            business_key: None,
         })
     }
 
@@ -183,6 +185,17 @@ impl EntryMetadata {
     #[must_use]
     pub fn idempotency_key(&self) -> Option<&str> {
         self.idempotency_key.as_deref()
+    }
+
+    pub fn with_business_key(mut self, business_key: Option<String>) -> Result<Self, LedgerError> {
+        validate_optional_identifier("business_key", business_key.as_deref())?;
+        self.business_key = business_key;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn business_key(&self) -> Option<&str> {
+        self.business_key.as_deref()
     }
 }
 
@@ -389,6 +402,7 @@ mod tests {
         assert_eq!(journal_entry.id().as_str(), "entry-1");
         assert_eq!(journal_entry.metadata().correlation_id(), Some("corr-1"));
         assert_eq!(journal_entry.metadata().idempotency_key(), Some("idem-1"));
+        assert_eq!(journal_entry.metadata().business_key(), None);
     }
 
     #[test]
@@ -495,6 +509,12 @@ mod tests {
         assert_eq!(
             EntryMetadata::new(None, Some(String::new())),
             Err(LedgerError::EmptyIdentifier("idempotency_key"))
+        );
+        assert_eq!(
+            EntryMetadata::new(None, Some("idem-1".to_owned()))
+                .unwrap()
+                .with_business_key(Some("   ".to_owned())),
+            Err(LedgerError::EmptyIdentifier("business_key"))
         );
     }
 }
