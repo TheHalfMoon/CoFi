@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use crate::{AccountId, Currency, JournalEntry, JournalEntryId, Side};
+use crate::{AccountId, Currency, JournalEntry, JournalEntryId, LedgerScopeId, Side};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AccountKind {
@@ -26,18 +26,34 @@ impl AccountKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
     id: AccountId,
+    scope_id: LedgerScopeId,
     kind: AccountKind,
     currency: Currency,
 }
 impl Account {
     #[must_use]
-    pub const fn new(id: AccountId, kind: AccountKind, currency: Currency) -> Self {
-        Self { id, kind, currency }
+    pub const fn new(
+        id: AccountId,
+        scope_id: LedgerScopeId,
+        kind: AccountKind,
+        currency: Currency,
+    ) -> Self {
+        Self {
+            id,
+            scope_id,
+            kind,
+            currency,
+        }
     }
 
     #[must_use]
     pub fn id(&self) -> &AccountId {
         &self.id
+    }
+
+    #[must_use]
+    pub const fn scope_id(&self) -> &LedgerScopeId {
+        &self.scope_id
     }
 
     #[must_use]
@@ -147,11 +163,23 @@ impl Ledger {
         }
 
         let mut deltas: BTreeMap<AccountId, AccountBalance> = BTreeMap::new();
+        let mut entry_scope: Option<LedgerScopeId> = None;
         for posting in entry.postings() {
             let account = self
                 .accounts
                 .get(posting.account_id())
                 .ok_or_else(|| LedgerStateError::UnknownAccount(posting.account_id().clone()))?;
+
+            if let Some(expected_scope) = &entry_scope {
+                if expected_scope != account.scope_id() {
+                    return Err(LedgerStateError::CrossScopeEntry {
+                        expected: expected_scope.clone(),
+                        actual: account.scope_id().clone(),
+                    });
+                }
+            } else {
+                entry_scope = Some(account.scope_id().clone());
+            }
 
             if account.currency() != posting.currency() {
                 return Err(LedgerStateError::AccountCurrencyMismatch {
@@ -222,6 +250,10 @@ pub enum LedgerStateError {
         expected: Currency,
         actual: Currency,
     },
+    CrossScopeEntry {
+        expected: LedgerScopeId,
+        actual: LedgerScopeId,
+    },
     BalanceOverflow(AccountId),
     InternalInvariant(&'static str),
 }
@@ -250,6 +282,12 @@ impl Display for LedgerStateError {
                 "account {} requires currency {expected}, got {actual}",
                 account_id.as_str()
             ),
+            Self::CrossScopeEntry { expected, actual } => write!(
+                f,
+                "journal entry crosses ledger scopes: expected {}, got {}",
+                expected.as_str(),
+                actual.as_str()
+            ),
             Self::BalanceOverflow(id) => {
                 write!(f, "account balance overflowed: {}", id.as_str())
             }
@@ -272,6 +310,10 @@ mod tests {
         AccountId::new(value).unwrap()
     }
 
+    fn scope(value: &str) -> LedgerScopeId {
+        LedgerScopeId::new(value).unwrap()
+    }
+
     fn usd() -> Currency {
         Currency::new("USD").unwrap()
     }
@@ -281,7 +323,7 @@ mod tests {
     }
 
     fn account(value: &str, kind: AccountKind, currency: Currency) -> Account {
-        Account::new(id(value), kind, currency)
+        Account::new(id(value), scope("org-1"), kind, currency)
     }
 
     fn entry(
@@ -324,6 +366,7 @@ mod tests {
     fn account_registration_and_normal_side_are_deterministic() {
         let mut ledger = Ledger::new();
         let asset = account("cash", AccountKind::Asset, usd());
+        assert_eq!(asset.scope_id(), &scope("org-1"));
         assert_eq!(asset.kind().normal_side(), Side::Debit);
         assert_eq!(AccountKind::Revenue.normal_side(), Side::Credit);
         ledger.register_account(asset.clone()).unwrap();

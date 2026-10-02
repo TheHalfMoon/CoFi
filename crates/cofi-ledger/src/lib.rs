@@ -55,6 +55,25 @@ impl MinorAmount {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LedgerScopeId(String);
+
+impl LedgerScopeId {
+    pub fn new(value: impl Into<String>) -> Result<Self, LedgerError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(LedgerError::EmptyIdentifier("ledger_scope_id"));
+        }
+
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AccountId(String);
 
 impl AccountId {
@@ -456,6 +475,14 @@ mod tests {
         assert_eq!(
             Currency::new("USDT"),
             Err(LedgerError::InvalidCurrency("USDT".to_owned()))
+        );
+    }
+
+    #[test]
+    fn empty_ledger_scope_identifier_is_rejected() {
+        assert_eq!(
+            LedgerScopeId::new("   "),
+            Err(LedgerError::EmptyIdentifier("ledger_scope_id"))
         );
     }
 
