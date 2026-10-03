@@ -358,18 +358,18 @@ impl SubscriptionRegistry {
         let schedule_key = request.schedule_key();
         if let Some(existing_ids) = self.schedules.get(&schedule_key) {
             for existing_id in existing_ids {
-                if let Some(existing) = self.subscription_for_id(existing_id)
-                    && intervals_overlap(
+                if let Some(existing) = self.subscription_for_id(existing_id) {
+                    if intervals_overlap(
                         request.active_from_unix_ms(),
                         request.active_until_unix_ms(),
                         existing.active_from_unix_ms(),
                         existing.active_until_unix_ms(),
-                    )
-                {
-                    return Err(SubscriptionError::OverlappingSchedule {
-                        subscription_id: request.subscription_id().clone(),
-                        existing_subscription_id: existing.id().clone(),
-                    });
+                    ) {
+                        return Err(SubscriptionError::OverlappingSchedule {
+                            subscription_id: request.subscription_id().clone(),
+                            existing_subscription_id: existing.id().clone(),
+                        });
+                    }
                 }
             }
         }
@@ -414,10 +414,10 @@ impl SubscriptionRegistry {
             return Ok(None);
         };
         for subscription_id in subscription_ids {
-            if let Some(subscription) = self.subscription_for_id(subscription_id)
-                && subscription.covers_window_unchecked(window_start_unix_ms, window_end_unix_ms)
-            {
-                return Ok(Some(subscription));
+            if let Some(subscription) = self.subscription_for_id(subscription_id) {
+                if subscription.covers_window_unchecked(window_start_unix_ms, window_end_unix_ms) {
+                    return Ok(Some(subscription));
+                }
             }
         }
         Ok(None)
