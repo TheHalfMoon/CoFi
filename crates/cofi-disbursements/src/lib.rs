@@ -202,8 +202,16 @@ impl Disbursement {
         self.submitted_at_unix_ms
     }
     #[must_use]
+    pub const fn provider_event_reference(&self) -> Option<&ProviderEventReference> {
+        self.provider_event_reference.as_ref()
+    }
+    #[must_use]
     pub const fn provider_settlement_reference(&self) -> Option<&ProviderSettlementReference> {
         self.provider_settlement_reference.as_ref()
+    }
+    #[must_use]
+    pub const fn terminal_at_unix_ms(&self) -> Option<i64> {
+        self.terminal_at_unix_ms
     }
     #[must_use]
     pub const fn failure_code(&self) -> Option<&FailureCode> {
