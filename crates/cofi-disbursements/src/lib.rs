@@ -150,6 +150,11 @@ impl DisbursementTerminalEvent {
             terminal_at_unix_ms,
         }
     }
+
+    #[must_use]
+    pub const fn kind(&self) -> &TerminalKind {
+        &self.kind
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisbursementStatus {

@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use cofi_disbursements::{DisbursementId, ProviderRequestReference};
+use cofi_disbursements::{
+    DisbursementId, DisbursementStatus, ProviderRequestReference, TerminalKind,
+};
 use cofi_reconciliation::{
     DiscrepancyKind, ReconciliationCase, ReconciliationCaseId, ReconciliationOutcome,
 };
@@ -171,6 +173,7 @@ pub struct ReconciliationAuditPayload {
     disbursement_id: DisbursementId,
     provider_request_reference: ProviderRequestReference,
     outcome_kind: ReconciliationAuditOutcomeKind,
+    terminal_status: Option<DisbursementStatus>,
     discrepancy_kind: Option<DiscrepancyKind>,
 }
 
@@ -190,6 +193,10 @@ impl ReconciliationAuditPayload {
     #[must_use]
     pub const fn outcome_kind(&self) -> ReconciliationAuditOutcomeKind {
         self.outcome_kind
+    }
+    #[must_use]
+    pub const fn terminal_status(&self) -> Option<DisbursementStatus> {
+        self.terminal_status
     }
     #[must_use]
     pub const fn discrepancy_kind(&self) -> Option<DiscrepancyKind> {
@@ -446,23 +453,38 @@ pub fn reconciliation_audit_event(
     case: &ReconciliationCase,
     outcome: &ReconciliationOutcome,
 ) -> Result<AuditEvent, AuditError> {
-    let (outcome_case_id, outcome_kind, discrepancy_kind) = match outcome {
+    let (outcome_case_id, outcome_kind, terminal_status, discrepancy_kind) = match outcome {
         ReconciliationOutcome::PendingAgreement { case_id } => (
             case_id,
             ReconciliationAuditOutcomeKind::PendingAgreement,
             None,
+            None,
         ),
-        ReconciliationOutcome::ProviderAhead { case_id, .. } => {
-            (case_id, ReconciliationAuditOutcomeKind::ProviderAhead, None)
+        ReconciliationOutcome::ProviderAhead {
+            case_id,
+            proposed_terminal_event,
+        } => {
+            let terminal_status = match proposed_terminal_event.kind() {
+                TerminalKind::Settled { .. } => DisbursementStatus::Settled,
+                TerminalKind::Failed { .. } => DisbursementStatus::Failed,
+            };
+            (
+                case_id,
+                ReconciliationAuditOutcomeKind::ProviderAhead,
+                Some(terminal_status),
+                None,
+            )
         }
-        ReconciliationOutcome::TerminalAgreement { case_id, .. } => (
+        ReconciliationOutcome::TerminalAgreement { case_id, status } => (
             case_id,
             ReconciliationAuditOutcomeKind::TerminalAgreement,
+            Some(*status),
             None,
         ),
         ReconciliationOutcome::Discrepancy { case_id, kind } => (
             case_id,
             ReconciliationAuditOutcomeKind::Discrepancy,
+            None,
             Some(*kind),
         ),
     };
@@ -475,6 +497,7 @@ pub fn reconciliation_audit_event(
         disbursement_id: case.disbursement_id().clone(),
         provider_request_reference: case.provider_request_reference().clone(),
         outcome_kind,
+        terminal_status,
         discrepancy_kind,
     };
     let action = AuditAction::new("reconciliation.observed")?;
@@ -526,6 +549,11 @@ fn encode_payload(target: &mut Vec<u8>, payload: &AuditPayload) {
                 b"outcome_kind",
                 reconciliation_outcome_code(payload.outcome_kind),
             );
+            if let Some(status) = payload.terminal_status {
+                push_field(target, b"terminal_status", disbursement_status_code(status));
+            } else {
+                push_field(target, b"terminal_status", b"none");
+            }
             if let Some(kind) = payload.discrepancy_kind {
                 push_field(target, b"discrepancy_kind", discrepancy_code(kind));
             } else {
@@ -541,6 +569,15 @@ const fn reconciliation_outcome_code(kind: ReconciliationAuditOutcomeKind) -> &'
         ReconciliationAuditOutcomeKind::ProviderAhead => b"provider_ahead",
         ReconciliationAuditOutcomeKind::TerminalAgreement => b"terminal_agreement",
         ReconciliationAuditOutcomeKind::Discrepancy => b"discrepancy",
+    }
+}
+
+const fn disbursement_status_code(status: DisbursementStatus) -> &'static [u8] {
+    match status {
+        DisbursementStatus::Ready => b"ready",
+        DisbursementStatus::Submitted => b"submitted",
+        DisbursementStatus::Settled => b"settled",
+        DisbursementStatus::Failed => b"failed",
     }
 }
 
@@ -610,21 +647,40 @@ mod internal_tests {
     use super::*;
 
     #[test]
-    fn verifier_detects_tampered_sequence_and_digest() {
-        let mut log = AuditLog::new();
-        let event = test_event(1, AuditDigest::GENESIS);
-        log.append(event).unwrap();
+    fn verifier_detects_tampered_sequence_previous_digest_and_digest() {
+        let mut canonical = AuditLog::new();
+        canonical
+            .append(test_event(1, AuditDigest::GENESIS))
+            .unwrap();
         let stream_id = AuditStreamId::new("stream-1").unwrap();
-        log.streams.get_mut(&stream_id).unwrap()[0]
+
+        let mut sequence_tampered = canonical.clone();
+        sequence_tampered.streams.get_mut(&stream_id).unwrap()[0]
             .position
             .sequence = 2;
         assert!(matches!(
-            log.verify_stream(&stream_id),
+            sequence_tampered.verify_stream(&stream_id),
             Err(AuditError::SequenceMismatch {
                 expected: 1,
                 actual: 2
             })
         ));
+
+        let mut previous_tampered = canonical.clone();
+        previous_tampered.streams.get_mut(&stream_id).unwrap()[0]
+            .position
+            .previous_digest = AuditDigest([1; 32]);
+        assert_eq!(
+            previous_tampered.verify_stream(&stream_id).unwrap_err(),
+            AuditError::PreviousDigestMismatch
+        );
+
+        let mut digest_tampered = canonical;
+        digest_tampered.streams.get_mut(&stream_id).unwrap()[0].digest = AuditDigest([2; 32]);
+        assert_eq!(
+            digest_tampered.verify_stream(&stream_id).unwrap_err(),
+            AuditError::DigestMismatch
+        );
     }
 
     fn test_event(sequence: u64, previous_digest: AuditDigest) -> AuditEvent {
@@ -644,6 +700,7 @@ mod internal_tests {
                 disbursement_id: DisbursementId::new("disb-1").unwrap(),
                 provider_request_reference: ProviderRequestReference::new("req-1").unwrap(),
                 outcome_kind: ReconciliationAuditOutcomeKind::PendingAgreement,
+                terminal_status: None,
                 discrepancy_kind: None,
             }),
         )

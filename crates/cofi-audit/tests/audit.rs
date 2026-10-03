@@ -6,7 +6,7 @@ use cofi_audit::{
 };
 use cofi_disbursements::{
     DisbursementEventId, DisbursementId, DisbursementStatus, DisbursementTerminalEvent,
-    ProviderEventReference, ProviderRequestReference, ProviderSettlementReference,
+    FailureCode, ProviderEventReference, ProviderRequestReference, ProviderSettlementReference,
 };
 use cofi_reconciliation::{
     DiscrepancyKind, ReconciliationCase, ReconciliationCaseId, ReconciliationOutcome,
@@ -83,9 +83,34 @@ fn identical_events_have_identical_digest_and_field_boundaries_are_unambiguous()
     let first = audit_event("event-1", 1, AuditDigest::GENESIS, "actor-a", &outcome);
     let second = audit_event("event-1", 1, AuditDigest::GENESIS, "actor-a", &outcome);
     let changed = audit_event("event-1", 1, AuditDigest::GENESIS, "actor-aa", &outcome);
+    let boundary_left = reconciliation_audit_event(
+        position("event-1", 1, AuditDigest::GENESIS),
+        AuditAttribution::new(
+            ActorId::new("ab").unwrap(),
+            Some(CorrelationId::new("c").unwrap()),
+            None,
+        ),
+        AuditTiming::new(50, 60).unwrap(),
+        &c,
+        &outcome,
+    )
+    .unwrap();
+    let boundary_right = reconciliation_audit_event(
+        position("event-1", 1, AuditDigest::GENESIS),
+        AuditAttribution::new(
+            ActorId::new("a").unwrap(),
+            Some(CorrelationId::new("bc").unwrap()),
+            None,
+        ),
+        AuditTiming::new(50, 60).unwrap(),
+        &c,
+        &outcome,
+    )
+    .unwrap();
 
     assert_eq!(first.digest(), second.digest());
     assert_ne!(first.digest(), changed.digest());
+    assert_ne!(boundary_left.digest(), boundary_right.digest());
     assert!(first.verify_digest());
     assert_eq!(first.digest().to_hex().len(), 64);
 }
@@ -190,25 +215,30 @@ fn reconciliation_adapter_maps_all_outcome_kinds() {
             pending(&c),
             ReconciliationAuditOutcomeKind::PendingAgreement,
             None,
+            None,
         ),
         (
             provider_ahead,
             ReconciliationAuditOutcomeKind::ProviderAhead,
+            Some(DisbursementStatus::Settled),
             None,
         ),
         (
             terminal,
             ReconciliationAuditOutcomeKind::TerminalAgreement,
+            Some(DisbursementStatus::Settled),
             None,
         ),
         (
             discrepancy,
             ReconciliationAuditOutcomeKind::Discrepancy,
+            None,
             Some(DiscrepancyKind::SettlementReferenceMismatch),
         ),
     ];
 
-    for (index, (outcome, expected_kind, expected_discrepancy)) in outcomes.into_iter().enumerate()
+    for (index, (outcome, expected_kind, expected_status, expected_discrepancy)) in
+        outcomes.into_iter().enumerate()
     {
         let event = audit_event(
             &format!("event-{index}"),
@@ -225,8 +255,37 @@ fn reconciliation_adapter_maps_all_outcome_kinds() {
             c.provider_request_reference()
         );
         assert_eq!(payload.outcome_kind(), expected_kind);
+        assert_eq!(payload.terminal_status(), expected_status);
         assert_eq!(payload.discrepancy_kind(), expected_discrepancy);
     }
+}
+
+#[test]
+fn provider_ahead_terminal_direction_changes_audit_digest() {
+    let c = case();
+    let settled = ReconciliationOutcome::ProviderAhead {
+        case_id: c.id().clone(),
+        proposed_terminal_event: DisbursementTerminalEvent::settled(
+            DisbursementEventId::new("settled-event").unwrap(),
+            c.disbursement_id().clone(),
+            ProviderEventReference::new("provider-settled").unwrap(),
+            ProviderSettlementReference::new("settlement-1").unwrap(),
+            40,
+        ),
+    };
+    let failed = ReconciliationOutcome::ProviderAhead {
+        case_id: c.id().clone(),
+        proposed_terminal_event: DisbursementTerminalEvent::failed(
+            DisbursementEventId::new("failed-event").unwrap(),
+            c.disbursement_id().clone(),
+            ProviderEventReference::new("provider-failed").unwrap(),
+            FailureCode::new("DECLINED").unwrap(),
+            40,
+        ),
+    };
+    let settled_event = audit_event("event-1", 1, AuditDigest::GENESIS, "actor-a", &settled);
+    let failed_event = audit_event("event-1", 1, AuditDigest::GENESIS, "actor-a", &failed);
+    assert_ne!(settled_event.digest(), failed_event.digest());
 }
 
 #[test]
