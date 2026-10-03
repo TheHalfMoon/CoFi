@@ -125,11 +125,10 @@ impl AuthorizedRatingRegistry {
     }
 
     #[must_use]
-    pub fn authorization_for_event(
-        &self,
-        event_id: &RatingEventId,
-    ) -> Option<&AuthorizedRating> {
-        self.events.get(event_id).map(|stored| &stored.authorization)
+    pub fn authorization_for_event(&self, event_id: &RatingEventId) -> Option<&AuthorizedRating> {
+        self.events
+            .get(event_id)
+            .map(|stored| &stored.authorization)
     }
 
     #[must_use]
