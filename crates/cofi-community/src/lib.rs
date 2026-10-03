@@ -6,6 +6,8 @@ use cofi_ledger::{AccountId, AccountKind, Currency, Ledger, LedgerScopeId};
 
 mod allocation;
 pub use allocation::*;
+mod transfer;
+pub use transfer::*;
 
 macro_rules! domain_id {
     ($name:ident, $label:literal) => {
