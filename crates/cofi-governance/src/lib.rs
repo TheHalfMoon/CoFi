@@ -274,6 +274,7 @@ pub struct ApprovedSpendingAuthorization {
     amount_minor: i128,
     purpose_reference: String,
     approver_party_ids: Vec<PartyId>,
+    approved_at_unix_ms: i64,
 }
 
 impl ApprovedSpendingAuthorization {
@@ -316,6 +317,10 @@ impl ApprovedSpendingAuthorization {
     #[must_use]
     pub fn approver_party_ids(&self) -> &[PartyId] {
         &self.approver_party_ids
+    }
+    #[must_use]
+    pub const fn approved_at_unix_ms(&self) -> i64 {
+        self.approved_at_unix_ms
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -508,6 +513,16 @@ impl GovernanceEngine {
         let approval_id = approval.id().clone();
         let source_event_id = approval.source_event_id.clone();
         let approver_party_id = approval.approver_party_id.clone();
+        let approved_at_unix_ms = self
+            .approvals
+            .values()
+            .filter(|existing| existing.proposal_id == approval.proposal_id)
+            .map(|existing| existing.approved_at_unix_ms)
+            .chain(std::iter::once(approval.approved_at_unix_ms))
+            .max()
+            .ok_or(GovernanceError::InternalInvariant(
+                "approval quorum timestamp is unavailable",
+            ))?;
         self.approvals.insert(approval_id.clone(), approval);
         self.approval_events
             .insert(source_event_id, approval_id.clone());
@@ -536,6 +551,7 @@ impl GovernanceEngine {
                 amount_minor: proposal.amount_minor,
                 purpose_reference: proposal.purpose_reference.clone(),
                 approver_party_ids,
+                approved_at_unix_ms,
             });
         }
         Ok(ApprovalOutcome::Recorded {
