@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/cofi-ledger", "crates/cofi-community", "crates/cofi-governance", "crates/cofi-spending", "crates/cofi-disbursements", "crates/cofi-provider-contract", "crates/cofi-reconciliation", "crates/cofi-metering", "crates/cofi-audit", "crates/cofi-billing", "crates/cofi-payments"]
+members = ["crates/cofi-ledger", "crates/cofi-community", "crates/cofi-governance", "crates/cofi-spending", "crates/cofi-disbursements", "crates/cofi-provider-contract", "crates/cofi-reconciliation", "crates/cofi-metering", "crates/cofi-audit", "crates/cofi-billing", "crates/cofi-payments", "crates/cofi-rating"]
 resolver = "3"
 
 [workspace.package]
