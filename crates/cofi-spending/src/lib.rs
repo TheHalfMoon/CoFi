@@ -98,6 +98,64 @@ impl ApprovedFundSpendEvent {
         self.amount_minor
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedFundSpend {
+    spend_id: FundSpendId,
+    proposal_id: SpendingProposalId,
+    journal_entry_id: JournalEntryId,
+    organization_id: OrganizationId,
+    community_id: CommunityId,
+    fund_id: FundId,
+    currency: Currency,
+    amount_minor: i128,
+    purpose_reference: String,
+    executed_at_unix_ms: i64,
+}
+
+impl VerifiedFundSpend {
+    #[must_use]
+    pub const fn spend_id(&self) -> &FundSpendId {
+        &self.spend_id
+    }
+    #[must_use]
+    pub const fn proposal_id(&self) -> &SpendingProposalId {
+        &self.proposal_id
+    }
+    #[must_use]
+    pub const fn journal_entry_id(&self) -> &JournalEntryId {
+        &self.journal_entry_id
+    }
+    #[must_use]
+    pub const fn organization_id(&self) -> &OrganizationId {
+        &self.organization_id
+    }
+    #[must_use]
+    pub const fn community_id(&self) -> &CommunityId {
+        &self.community_id
+    }
+    #[must_use]
+    pub const fn fund_id(&self) -> &FundId {
+        &self.fund_id
+    }
+    #[must_use]
+    pub const fn currency(&self) -> Currency {
+        self.currency
+    }
+    #[must_use]
+    pub const fn amount_minor(&self) -> i128 {
+        self.amount_minor
+    }
+    #[must_use]
+    pub fn purpose_reference(&self) -> &str {
+        &self.purpose_reference
+    }
+    #[must_use]
+    pub const fn executed_at_unix_ms(&self) -> i64 {
+        self.executed_at_unix_ms
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FundSpendOutcome {
     Committed { journal_entry_id: JournalEntryId },
@@ -120,93 +178,12 @@ impl FundSpendBridge {
         event: &ApprovedFundSpendEvent,
         ledger: &mut Ledger,
     ) -> Result<FundSpendOutcome, FundSpendError> {
-        let authorization = governance
-            .authorization(event.proposal_id())
-            .ok_or_else(|| FundSpendError::UnknownAuthorization(event.proposal_id.clone()))?;
-        validate_authorization_snapshot(event, authorization)?;
-        if event.executed_at_unix_ms < authorization.approved_at_unix_ms() {
-            return Err(FundSpendError::ExecutionBeforeApproval {
-                approved_at_unix_ms: authorization.approved_at_unix_ms(),
-                executed_at_unix_ms: event.executed_at_unix_ms,
-            });
-        }
-
-        let fund = registry
-            .fund(authorization.fund_id())
-            .ok_or_else(|| FundSpendError::UnknownFund(authorization.fund_id().clone()))?;
-        let community = registry
-            .community(authorization.community_id())
-            .ok_or_else(|| {
-                FundSpendError::UnknownCommunity(authorization.community_id().clone())
-            })?;
-        if fund.community_id() != authorization.community_id() {
-            return Err(FundSpendError::FundCommunityMismatch);
-        }
-        if community.organization_id() != authorization.organization_id() {
-            return Err(FundSpendError::CommunityOrganizationMismatch);
-        }
-        if fund.currency() != authorization.currency() {
-            return Err(FundSpendError::FundCurrencyMismatch {
-                expected: authorization.currency(),
-                actual: fund.currency(),
-            });
-        }
-        if fund.ledger_account_id() == &event.expense_account_id {
-            return Err(FundSpendError::SamePostingAccount(
-                event.expense_account_id.clone(),
-            ));
-        }
-        validate_account(
-            ledger,
-            fund.ledger_account_id(),
-            authorization.organization_id(),
-            authorization.currency(),
-            AccountKind::Asset,
-        )?;
-        validate_account(
-            ledger,
-            &event.expense_account_id,
-            authorization.organization_id(),
-            authorization.currency(),
-            AccountKind::Expense,
-        )?;
-
-        let entry_id = journal_entry_id_for_fund_spend(event.spend_id())?;
-        let metadata = EntryMetadata::new(
-            Some(spend_payload_correlation(event)),
-            Some(event.source_event_id.as_str().to_owned()),
-        )
-        .and_then(|metadata| {
-            metadata.with_business_key(Some(format!(
-                "spending:authorization:{}",
-                event.proposal_id.as_str()
-            )))
-        })
-        .map_err(FundSpendError::LedgerBuild)?;
-        let postings = vec![
-            Posting::new(
-                event.expense_account_id.clone(),
-                authorization.currency(),
-                Side::Debit,
-                authorization.amount_minor(),
-            )
-            .map_err(FundSpendError::LedgerBuild)?,
-            Posting::new(
-                fund.ledger_account_id().clone(),
-                authorization.currency(),
-                Side::Credit,
-                authorization.amount_minor(),
-            )
-            .map_err(FundSpendError::LedgerBuild)?,
-        ];
-        let entry = JournalEntry::new(
-            entry_id.clone(),
-            postings,
-            event.executed_at_unix_ms,
-            event.observed_at_unix_ms,
-            metadata,
-        )
-        .map_err(FundSpendError::LedgerBuild)?;
+        let PreparedFundSpend {
+            entry,
+            fund_account_id,
+            receipt: _,
+        } = prepare_spend(registry, governance, event, ledger)?;
+        let entry_id = entry.id().clone();
 
         if let Some(existing) = ledger.entry(&entry_id) {
             return if existing == &entry {
@@ -218,16 +195,16 @@ impl FundSpendBridge {
             };
         }
 
-        let balance = ledger.balance(fund.ledger_account_id()).ok_or_else(|| {
-            FundSpendError::UnknownLedgerAccount(fund.ledger_account_id().clone())
-        })?;
+        let balance = ledger
+            .balance(&fund_account_id)
+            .ok_or_else(|| FundSpendError::UnknownLedgerAccount(fund_account_id.clone()))?;
         let available = balance.debits().checked_sub(balance.credits()).ok_or(
             FundSpendError::FundNegativeBalance {
                 debits: balance.debits(),
                 credits: balance.credits(),
             },
         )?;
-        let requested = authorization.amount_minor() as u128;
+        let requested = event.amount_minor as u128;
         if available < requested {
             return Err(FundSpendError::InsufficientFundBalance {
                 available,
@@ -244,6 +221,137 @@ impl FundSpendBridge {
             }),
         }
     }
+
+    pub fn verify_committed(
+        &self,
+        registry: &CommunityRegistry,
+        governance: &GovernanceEngine,
+        event: &ApprovedFundSpendEvent,
+        ledger: &Ledger,
+    ) -> Result<VerifiedFundSpend, FundSpendError> {
+        let prepared = prepare_spend(registry, governance, event, ledger)?;
+        match ledger.entry(prepared.entry.id()) {
+            Some(existing) if existing == &prepared.entry => Ok(prepared.receipt),
+            Some(_) => Err(FundSpendError::SpendIdConflict(event.spend_id.clone())),
+            None => Err(FundSpendError::UncommittedSpend(event.spend_id.clone())),
+        }
+    }
+}
+
+struct PreparedFundSpend {
+    entry: JournalEntry,
+    fund_account_id: AccountId,
+    receipt: VerifiedFundSpend,
+}
+
+fn prepare_spend(
+    registry: &CommunityRegistry,
+    governance: &GovernanceEngine,
+    event: &ApprovedFundSpendEvent,
+    ledger: &Ledger,
+) -> Result<PreparedFundSpend, FundSpendError> {
+    let authorization = governance
+        .authorization(event.proposal_id())
+        .ok_or_else(|| FundSpendError::UnknownAuthorization(event.proposal_id.clone()))?;
+    validate_authorization_snapshot(event, authorization)?;
+    if event.executed_at_unix_ms < authorization.approved_at_unix_ms() {
+        return Err(FundSpendError::ExecutionBeforeApproval {
+            approved_at_unix_ms: authorization.approved_at_unix_ms(),
+            executed_at_unix_ms: event.executed_at_unix_ms,
+        });
+    }
+
+    let fund = registry
+        .fund(authorization.fund_id())
+        .ok_or_else(|| FundSpendError::UnknownFund(authorization.fund_id().clone()))?;
+    let community = registry
+        .community(authorization.community_id())
+        .ok_or_else(|| FundSpendError::UnknownCommunity(authorization.community_id().clone()))?;
+    if fund.community_id() != authorization.community_id() {
+        return Err(FundSpendError::FundCommunityMismatch);
+    }
+    if community.organization_id() != authorization.organization_id() {
+        return Err(FundSpendError::CommunityOrganizationMismatch);
+    }
+    if fund.currency() != authorization.currency() {
+        return Err(FundSpendError::FundCurrencyMismatch {
+            expected: authorization.currency(),
+            actual: fund.currency(),
+        });
+    }
+    if fund.ledger_account_id() == &event.expense_account_id {
+        return Err(FundSpendError::SamePostingAccount(
+            event.expense_account_id.clone(),
+        ));
+    }
+    validate_account(
+        ledger,
+        fund.ledger_account_id(),
+        authorization.organization_id(),
+        authorization.currency(),
+        AccountKind::Asset,
+    )?;
+    validate_account(
+        ledger,
+        &event.expense_account_id,
+        authorization.organization_id(),
+        authorization.currency(),
+        AccountKind::Expense,
+    )?;
+
+    let entry_id = journal_entry_id_for_fund_spend(event.spend_id())?;
+    let metadata = EntryMetadata::new(
+        Some(spend_payload_correlation(event)),
+        Some(event.source_event_id.as_str().to_owned()),
+    )
+    .and_then(|metadata| {
+        metadata.with_business_key(Some(format!(
+            "spending:authorization:{}",
+            event.proposal_id.as_str()
+        )))
+    })
+    .map_err(FundSpendError::LedgerBuild)?;
+    let postings = vec![
+        Posting::new(
+            event.expense_account_id.clone(),
+            authorization.currency(),
+            Side::Debit,
+            authorization.amount_minor(),
+        )
+        .map_err(FundSpendError::LedgerBuild)?,
+        Posting::new(
+            fund.ledger_account_id().clone(),
+            authorization.currency(),
+            Side::Credit,
+            authorization.amount_minor(),
+        )
+        .map_err(FundSpendError::LedgerBuild)?,
+    ];
+    let entry = JournalEntry::new(
+        entry_id.clone(),
+        postings,
+        event.executed_at_unix_ms,
+        event.observed_at_unix_ms,
+        metadata,
+    )
+    .map_err(FundSpendError::LedgerBuild)?;
+    let receipt = VerifiedFundSpend {
+        spend_id: event.spend_id.clone(),
+        proposal_id: event.proposal_id.clone(),
+        journal_entry_id: entry_id,
+        organization_id: event.organization_id.clone(),
+        community_id: event.community_id.clone(),
+        fund_id: event.fund_id.clone(),
+        currency: event.currency,
+        amount_minor: event.amount_minor,
+        purpose_reference: event.purpose_reference.clone(),
+        executed_at_unix_ms: event.executed_at_unix_ms,
+    };
+    Ok(PreparedFundSpend {
+        entry,
+        fund_account_id: fund.ledger_account_id().clone(),
+        receipt,
+    })
 }
 
 pub fn journal_entry_id_for_fund_spend(
@@ -368,6 +476,7 @@ pub enum FundSpendError {
         actual: Currency,
     },
     SpendIdConflict(FundSpendId),
+    UncommittedSpend(FundSpendId),
     FundNegativeBalance {
         debits: u128,
         credits: u128,
@@ -452,6 +561,9 @@ impl Display for FundSpendError {
                 actual.code()
             ),
             Self::SpendIdConflict(id) => write!(formatter, "spend id {} conflicts", id.as_str()),
+            Self::UncommittedSpend(id) => {
+                write!(formatter, "spend {} is not committed", id.as_str())
+            }
             Self::FundNegativeBalance { debits, credits } => write!(
                 formatter,
                 "fund balance is negative: debits={debits}, credits={credits}"
