@@ -198,6 +198,10 @@ impl Disbursement {
         self.provider_request_reference.as_ref()
     }
     #[must_use]
+    pub const fn submitted_at_unix_ms(&self) -> Option<i64> {
+        self.submitted_at_unix_ms
+    }
+    #[must_use]
     pub const fn provider_settlement_reference(&self) -> Option<&ProviderSettlementReference> {
         self.provider_settlement_reference.as_ref()
     }
