@@ -8,6 +8,8 @@ mod allocation;
 pub use allocation::*;
 mod transfer;
 pub use transfer::*;
+mod distribution;
+pub use distribution::*;
 
 macro_rules! domain_id {
     ($name:ident, $label:literal) => {
