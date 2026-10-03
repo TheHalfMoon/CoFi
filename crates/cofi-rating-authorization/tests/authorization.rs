@@ -173,10 +173,7 @@ fn authorized_rating_derives_plan_from_subscription_and_preserves_lineage() {
         .unwrap();
     assert!(matches!(outcome, AuthorizedRatingOutcome::Rated { .. }));
     let authorization = outcome.authorization();
-    assert_eq!(
-        authorization.subscription().id().as_str(),
-        "subscription-1"
-    );
+    assert_eq!(authorization.subscription().id().as_str(), "subscription-1");
     assert_eq!(
         authorization.subscription().source_event_id().as_str(),
         "subscription-event-1"
@@ -233,13 +230,7 @@ fn exact_replay_returns_historical_authorization_without_re_resolving() {
 #[test]
 fn missing_subscription_reserves_nothing_and_corrected_retry_succeeds() {
     let aggregate = count_aggregate("meter-1", "subject-1", 2);
-    let rating_request = request(
-        "rating-retry",
-        "org-1",
-        "customer-1",
-        aggregate,
-        DAY,
-    );
+    let rating_request = request("rating-retry", "org-1", "customer-1", aggregate, DAY);
     let mut subscriptions = SubscriptionRegistry::new();
     let mut registry = AuthorizedRatingRegistry::new();
 
@@ -265,10 +256,7 @@ fn missing_subscription_reserves_nothing_and_corrected_retry_succeeds() {
         Some(DAY),
     );
     let corrected = registry.rate(rating_request, &subscriptions).unwrap();
-    assert!(matches!(
-        corrected,
-        AuthorizedRatingOutcome::Rated { .. }
-    ));
+    assert!(matches!(corrected, AuthorizedRatingOutcome::Rated { .. }));
     assert_eq!(registry.authorization_count(), 1);
     assert_eq!(registry.rating_event_count(), 1);
 }
@@ -280,18 +268,8 @@ fn wrong_scope_customer_or_subject_fails_closed() {
 
     for (event, scope_id, customer_id, subject_id) in [
         ("rating-wrong-scope", "org-2", "customer-1", "subject-1"),
-        (
-            "rating-wrong-customer",
-            "org-1",
-            "customer-2",
-            "subject-1",
-        ),
-        (
-            "rating-wrong-subject",
-            "org-1",
-            "customer-1",
-            "subject-2",
-        ),
+        ("rating-wrong-customer", "org-1", "customer-2", "subject-1"),
+        ("rating-wrong-subject", "org-1", "customer-1", "subject-2"),
     ] {
         let error = registry
             .rate(
@@ -402,13 +380,7 @@ fn conflicting_reuse_of_rating_event_fails_before_second_rating() {
 
     let error = registry
         .rate(
-            request(
-                "rating-conflict",
-                "org-1",
-                "customer-1",
-                aggregate,
-                DAY + 1,
-            ),
+            request("rating-conflict", "org-1", "customer-1", aggregate, DAY + 1),
             &subscriptions,
         )
         .unwrap_err();
@@ -440,13 +412,7 @@ fn second_event_for_same_usage_window_is_rejected_by_canonical_rating_key() {
 
     let error = registry
         .rate(
-            request(
-                "rating-second",
-                "org-1",
-                "customer-1",
-                aggregate,
-                DAY,
-            ),
+            request("rating-second", "org-1", "customer-1", aggregate, DAY),
             &subscriptions,
         )
         .unwrap_err();
