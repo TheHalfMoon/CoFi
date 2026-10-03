@@ -8,6 +8,12 @@ use cofi_billing::{
 use cofi_ledger::{Currency, LedgerScopeId};
 use cofi_rating::{RatedCharge, RatedChargeId};
 
+mod finalization;
+pub use finalization::{
+    FinalizationError, FinalizationOutcome, FinalizationRegistry, FinalizationRequest,
+    FinalizedInvoice,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DraftInvoiceLine {
     rated_charge: RatedCharge,
